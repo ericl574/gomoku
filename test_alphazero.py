@@ -114,6 +114,7 @@ class SearchTests(unittest.TestCase):
         self.assertTrue(all(c.prior == c.base_prior for c in root.children.values()))
 
     @torch.no_grad()
+    @patch("state.COLOR_PLANE", True)  # the fake network tells players apart by plane 2
     def test_cache_keys_include_player_and_reset_invalidates_cache(self):
         model = CountingNetwork().eval()
         searcher = MCTS(model, simulations=1, cache_size=2)

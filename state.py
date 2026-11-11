@@ -1,6 +1,16 @@
 import numpy as np
 
 
+# Does the network see whose turn it is (plane 2 of encode())?
+# False = color-blind: plane 2 is always 0, i.e. every position is shown the
+# way white saw it. While one color wins almost every game, a color plane lets
+# the value head cheat ("black to move = lost") and stops it reading the board.
+# The color is still implied by stone counts (equal counts = black to move).
+# Set back to True once self-play black/white wins are roughly balanced; the
+# input shape does not change, so every checkpoint keeps working.
+COLOR_PLANE = False
+
+
 class GomokuState:
     def __init__(self):
         self.size = 19
@@ -97,7 +107,7 @@ class GomokuState:
         opponent_stones = self.board == -self.current_player
         black_to_move = np.full(
             (self.size, self.size),
-            self.current_player == 1,
+            COLOR_PLANE and self.current_player == 1,
         )
 
         return np.stack(

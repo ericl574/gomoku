@@ -5,7 +5,7 @@ from concurrent.futures import ProcessPoolExecutor
 from copy import deepcopy
 from itertools import repeat
 from pathlib import Path
-from uuid import uuid4
+from datetime import datetime
 
 import numpy as np
 import torch
@@ -24,6 +24,7 @@ from rich.table import Table
 from evaluate import play_match
 from network import GomokuNetwork
 from self_play import play_game
+import state as game_rules
 
 
 class ReplayBuffer:
@@ -177,6 +178,7 @@ def train(
     eval_games=20,
     cpu_threads=None,
     self_play_workers=1,
+    init_checkpoint=None,
 ):
     counts = (
         self_play_workers,
@@ -232,9 +234,19 @@ def train(
         "residual_blocks": 3,
     }
 
-    model = GomokuNetwork(**model_config)
+    start = None
+    if init_checkpoint is not None:
+        # Continue from a saved model (e.g. one taught in web learning mode)
+        # instead of random weights. The replay buffer still starts empty.
+        start = torch.load(init_checkpoint, map_location="cpu", weights_only=True)
+        model_config = start["model_config"]
 
-    # This opponent stays unchanged throughout the run.
+    model = GomokuNetwork(**model_config)
+    if start is not None:
+        model.load_state_dict(start["model_state_dict"])
+
+    # This opponent stays unchanged throughout the run
+    # (the random start, or the loaded model when init_checkpoint is given).
     initial_opponent = deepcopy(model)
     initial_opponent.eval()
     initial_opponent.requires_grad_(False)
@@ -243,13 +255,19 @@ def train(
         model.parameters(),
         lr=learning_rate,
     )
+    if start is not None and "optimizer_state_dict" in start:
+        optimizer.load_state_dict(start["optimizer_state_dict"])
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate  # this run's learning rate wins
     replay = ReplayBuffer(buffer_capacity)
 
-    run_dir = (
-        Path(__file__).resolve().parent
-        / "checkpoints"
-        / f"alphazero_{uuid4().hex}"
-    )
+    # Readable run name: start time + search budget, e.g. 2026-11-10_1230_sims512.
+    run_name = f"{datetime.now():%Y-%m-%d_%H%M}_sims{simulations}"
+    run_dir = Path(__file__).resolve().parent / "checkpoints" / run_name
+    suffix = 2
+    while run_dir.exists():  # two runs started in the same minute
+        run_dir = run_dir.with_name(f"{run_name}-{suffix}")
+        suffix += 1
     run_dir.mkdir(parents=True, exist_ok=False)
     history_path = run_dir / "history.jsonl"
 
@@ -427,9 +445,12 @@ def train(
 
             evaluation = None
 
-            checkpoint_path = run_dir / f"iteration_{iteration:03d}.pt"
+            checkpoint_path = (
+                run_dir / f"round_{iteration:03d}_games{completed_games:04d}.pt"
+            )
             checkpoint = {
                 "iteration": iteration,
+                "games_completed": completed_games,
                 "updates_completed": completed_updates,
                 "model_config": model_config,
                 "model_state_dict": model.state_dict(),
@@ -437,10 +458,12 @@ def train(
                 "metrics": averages,
                 "evaluation": None,
                 "seed": seed,
+                "init_checkpoint": None if init_checkpoint is None else str(init_checkpoint),
                 "simulations": simulations,
                 "runtime_config": {
                     "cpu_threads": torch.get_num_threads(),
                     "tree_reuse": True,
+                    "color_plane": game_rules.COLOR_PLANE,
                     "cache_size": 0,
                     "eval_every": eval_every,
                     "eval_games": eval_games,

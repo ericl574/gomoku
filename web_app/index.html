@@ -22,7 +22,7 @@
     <main>
       <section class="intro" aria-labelledby="title">
         <div><p class="eyebrow">NINETEEN LINES. FIVE TO WIN.</p><h1 id="title">Meet your next move.</h1></div>
-        <p class="intro-note">Your trained AI takes black.<br> You bring the white stones.</p>
+        <p class="intro-note" id="intro-note">Your trained AI takes black.<br> You bring the white stones.</p>
       </section>
 
       <div class="game-layout">
@@ -45,8 +45,8 @@
           </section>
 
           <div class="players">
-            <div class="player" id="player-black"><span class="player-stone black" aria-hidden="true"></span><div><h3>Your AI</h3><p>Black · moves first</p></div><span class="player-tag" id="black-tag">AI</span></div>
-            <div class="player" id="player-white"><span class="player-stone white" aria-hidden="true"></span><div><h3>You</h3><p>White · make it five</p></div><span class="player-tag" id="white-tag">YOU</span></div>
+            <div class="player" id="player-black"><span class="player-stone black" aria-hidden="true"></span><div><h3 id="black-name">Your AI</h3><p>Black · moves first</p></div><span class="player-tag" id="black-tag">AI</span></div>
+            <div class="player" id="player-white"><span class="player-stone white" aria-hidden="true"></span><div><h3 id="white-name">You</h3><p>White · make it five</p></div><span class="player-tag" id="white-tag">YOU</span></div>
           </div>
 
           <button class="new-game" id="new-game" type="button" disabled><span aria-hidden="true">↻</span> New game</button>
@@ -54,6 +54,7 @@
 
           <section class="game-details" aria-label="Last move"><span>LAST AI MOVE</span><strong id="last-ai-move">—</strong></section>
           <section class="game-details" aria-label="AI model"><span>AI MODEL</span><strong id="model-info" title="">—</strong></section>
+          <section class="game-details" aria-label="Learning mode"><span>LEARNING</span><strong id="learning-info" title="">—</strong></section>
 
           <section class="how-to"><h3>A little strategy, a little instinct.</h3><p>Connect five stones in a horizontal, vertical, or diagonal line before your opponent does.</p><div class="five-stones" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div><p class="quiet-note">No clock. Take your time.</p></section>
         </aside>

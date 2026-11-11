@@ -1,0 +1,13 @@
+# Training outputs: large, and they can be regenerated locally
+checkpoints/
+game_logs/
+*.pt
+*.pt.tmp
+*.npz
+
+# Python caches
+__pycache__/
+*.py[cod]
+
+# macOS
+.DS_Store
