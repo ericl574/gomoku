@@ -19,6 +19,7 @@ from self_play import select_action
 from state import GomokuState
 import state as game_rules
 from train import ReplayBuffer, save_checkpoint, train_step
+from promote import read_best
 
 
 APP_DIR = Path(__file__).resolve().parent
@@ -63,16 +64,40 @@ def load_model(path):
     return model, info
 
 
-class CheckpointWatcher:
-    """Decides which checkpoint should play: the newest one, or a pinned file."""
+def best_checkpoint(root=CHECKPOINT_ROOT):
+    """The model named in <root>/best.json (set only by promote.py), or None."""
+    record = read_best(root)
+    return Path(record["path"]) if record else None
 
-    def __init__(self, root=CHECKPOINT_ROOT, pinned=None):
+
+class CheckpointWatcher:
+    """Decides which checkpoint should play.
+
+    pinned file > best (best.json, if it exists) > latest (newest .pt file).
+    use_best=False skips best and always follows the latest file.
+    """
+
+    def __init__(self, root=CHECKPOINT_ROOT, pinned=None, use_best=True):
         self.root = Path(root)
         self.pinned = Path(pinned) if pinned is not None else None
+        self.use_best = use_best
 
     def current(self):
-        path = self.pinned if self.pinned is not None else find_latest_checkpoint(self.root)
+        path = self.pinned
+        if path is None and self.use_best:
+            path = best_checkpoint(self.root)
+        if path is None:
+            path = find_latest_checkpoint(self.root)
         return path, path.stat().st_mtime_ns
+
+    def describe(self):
+        if self.pinned is not None:
+            return "pinned with --checkpoint"
+        record = read_best(self.root) if self.use_best else None
+        if record:
+            return (f"BEST ({record['status']}; checked again at each new game; "
+                    f"use --latest for the newest checkpoint instead)")
+        return "LATEST checkpoint (no best.json yet), checked again at each new game"
 
 
 class WebLearner:
@@ -585,8 +610,10 @@ def main():
     parser.add_argument("--simulations", type=int, default=DEFAULT_SIMULATIONS,
                         help="MCTS simulations per AI move (default %(default)s)")
     parser.add_argument("--checkpoint", type=Path, default=None,
-                        help="Pin one .pt file. Default: newest checkpoints/<run>/*.pt, "
-                             "re-checked at every new game")
+                        help="Pin one .pt file. Default: the best model (checkpoints/best.json), "
+                             "or the newest checkpoint if no best exists yet")
+    parser.add_argument("--latest", action="store_true",
+                        help="Use the newest checkpoint instead of the best model")
     parser.add_argument("--learn", action="store_true",
                         help="Learning mode: the AI trains on every finished game against you")
     parser.add_argument("--learn-updates", type=int, default=10,
@@ -616,14 +643,15 @@ def main():
     try:
         if args.learn:
             # Start from one checkpoint, then keep training that same model.
-            path = args.checkpoint or find_latest_checkpoint()
+            # Learning continues from: --checkpoint > best > latest (or latest with --latest).
+            path, _ = CheckpointWatcher(pinned=args.checkpoint, use_best=not args.latest).current()
             model, info = load_model(path)
             learner = WebLearner(model, path, args.simulations, updates=args.learn_updates,
                                  imitate_weight=args.imitate, fresh=args.fresh)
             game = GomokuGame(model, info, simulations=args.simulations, learner=learner,
                               log_dir=GAME_LOG_DIR)
         else:
-            watcher = CheckpointWatcher(pinned=args.checkpoint)
+            watcher = CheckpointWatcher(pinned=args.checkpoint, use_best=not args.latest)
             game = GomokuGame(simulations=args.simulations, watcher=watcher,
                               log_dir=GAME_LOG_DIR)
         server = make_server(game, args.port)
@@ -636,9 +664,10 @@ def main():
                 f"{args.learn_updates} updates each; "
                 f"{len(learner.buffer)} positions from earlier sessions loaded"
                 + (f", {learner.skipped_games} games from before {learner.cutoff} skipped"
-                   if learner.cutoff else ""))
+                   if learner.cutoff else "")
+                + ". Its saves count as LATEST only; only promote.py can change BEST")
     else:
-        mode = "pinned" if args.checkpoint else "auto-updates to the newest checkpoint at each new game"
+        mode = watcher.describe()
     print(f"Gomoku is ready: http://127.0.0.1:{server.server_port}", flush=True)
     print(f"AI: {game.info['run']}/{game.info['file']} ({mode}), "
           f"{args.simulations} MCTS simulations per move, CPU.", flush=True)

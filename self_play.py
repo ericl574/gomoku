@@ -29,7 +29,9 @@ def play_game(
     exploration_moves=30,
     seed=None,
     progress_callback=None,
+    move_log=None,
 ):
+    """move_log: optional list; one dict per move is appended (for game logs)."""
     if (
         isinstance(exploration_moves, bool)
         or not isinstance(exploration_moves, (int, np.integer))
@@ -61,7 +63,7 @@ def play_game(
                     **searcher.last_search_stats,
                 })
 
-        policy, _ = searcher.search(
+        policy, root = searcher.search(
             state,
             add_noise=True,
             progress_callback=report_search if progress_callback else None,
@@ -80,6 +82,19 @@ def play_game(
             rng,
             sample=len(history) <= exploration_moves,
         )
+        if move_log is not None:
+            # What the search saw; q is from the mover's side (-child.q, as in _select).
+            top = sorted(root.children.items(), key=lambda kv: kv[1].visit_count,
+                         reverse=True)[:5]
+            move_log.append({
+                "player": int(state.current_player),
+                "action": int(action),
+                "value": root.q,
+                "visited": sum(c.visit_count > 0 for c in root.children.values()),
+                "candidates": len(root.children),
+                "win_in_one": searcher.last_search_stats.get("win_in_one", 0),
+                "top": [(int(a), c.visit_count, c.base_prior, -c.q) for a, c in top],
+            })
         state.step(action)
         searcher.advance(action, state)
 

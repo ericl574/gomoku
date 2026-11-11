@@ -98,13 +98,49 @@ class ReplayBuffer:
             ).unsqueeze(1),
         )
 
-def self_play_worker(model_config, state_dict, simulations, seed):
+def self_play_worker(model_config, state_dict, simulations, seed, exploration_moves=6):
     """One self-play game in a worker process; same game as the serial path."""
     torch.set_num_threads(1)
     model = GomokuNetwork(**model_config)
     model.load_state_dict(state_dict)
     model.eval()
-    return play_game(model, simulations=simulations, seed=seed)
+    move_log = []
+    samples, final_state = play_game(
+        model, simulations=simulations, seed=seed, move_log=move_log,
+        exploration_moves=exploration_moves,
+    )
+    return samples, final_state, move_log
+
+
+def format_selfplay_game(iteration, game, move_log, final_state, detailed):
+    """One self-play game as text. detailed=True adds what the search saw per move."""
+    def coord(action):
+        return f"{chr(65 + action % 19)}{action // 19 + 1}"  # web board labels
+
+    def color(player):
+        return "B" if player == 1 else "W"
+
+    winner = {1: "black won", -1: "white won", 0: "draw"}[int(final_state.winner)]
+    lines = [f"=== Round {iteration} game {game} | {winner} in {len(move_log)} moves"]
+    if detailed:
+        lines.append("value = mover's search estimate (+1 winning); top: n visits, "
+                     "p network prior, q mover's estimate; w1 = win-in-one hits")
+        for number, move in enumerate(move_log, 1):
+            top = ", ".join(f"{coord(a)} n={n} p={p:.3f} q={q:+.2f}"
+                            for a, n, p, q in move["top"])
+            lines.append(
+                f"{number:3d}. {color(move['player'])} {coord(move['action']):>4}   "
+                f"value {move['value']:+.2f}, searched {move['visited']}/"
+                f"{move['candidates']}, w1 {move['win_in_one']} | top: {top}")
+        lines.append("final board (X black, O white):")
+        lines.append("    " + " ".join(chr(65 + c) for c in range(19)))
+        for r in range(19):
+            marks = " ".join({1: "X", -1: "O", 0: "."}[int(v)] for v in final_state.board[r])
+            lines.append(f"{r + 1:3d} {marks}")
+    else:
+        moves = [f"{color(m['player'])} {coord(m['action'])}" for m in move_log]
+        lines += ["    " + "  ".join(moves[k:k + 12]) for k in range(0, len(moves), 12)]
+    return "\n".join(lines) + "\n\n"
 
 
 def train_step(model, optimizer, batch):
@@ -179,7 +215,12 @@ def train(
     cpu_threads=None,
     self_play_workers=1,
     init_checkpoint=None,
+    exploration_moves=6,
 ):
+    # exploration_moves: the first N moves of each self-play game are sampled in
+    # proportion to visits (variety); later moves play the most-visited move.
+    # AlphaZero used 30 for Go (200+ move games); Gomoku games are ~10-40 moves,
+    # so 30 would make nearly every move random.
     counts = (
         self_play_workers,
         iterations,
@@ -270,6 +311,10 @@ def train(
         suffix += 1
     run_dir.mkdir(parents=True, exist_ok=False)
     history_path = run_dir / "history.jsonl"
+    # Every self-play game; the first game of each round with full search details.
+    game_log_path = (
+        Path(__file__).resolve().parent / "game_logs" / f"selfplay_{run_dir.name}.txt"
+    )
 
     total_games = iterations * games_per_iteration
     total_updates = iterations * updates_per_iteration
@@ -280,7 +325,8 @@ def train(
 
     status = {
         "Stage": "Starting",
-        "Search / batch": f"{simulations} simulations / up to {batch_size}",
+        "Search / batch": (f"{simulations} simulations, first {exploration_moves} moves "
+                           f"sampled / batch up to {batch_size}"),
         "CPU threads": str(torch.get_num_threads()),
         "Current move": "--",
         "Game elapsed": "--",
@@ -319,6 +365,7 @@ def train(
     )
 
     print("Run directory:", run_dir, flush=True)
+    print("Self-play games are logged to", game_log_path, flush=True)
 
     with Live(
         render_dashboard(progress, status),
@@ -364,11 +411,12 @@ def train(
                     repeat(snapshot.state_dict()),
                     repeat(simulations),
                     seeds,
+                    repeat(exploration_moves),
                 )
 
             for game in range(1, games_per_iteration + 1):
                 if pool is not None:
-                    samples, final_state = next(parallel_games)
+                    samples, final_state, move_log = next(parallel_games)
                 else:
                     status["Stage"] = (
                         f"Round {iteration}/{iterations}: "
@@ -376,12 +424,20 @@ def train(
                     )
                     live.update(render_dashboard(progress, status))
 
+                    move_log = []
                     samples, final_state = play_game(
                         snapshot,
                         simulations=simulations,
                         seed=seeds[game - 1],
                         progress_callback=report_search,
+                        move_log=move_log,
+                        exploration_moves=exploration_moves,
                     )
+
+                game_log_path.parent.mkdir(parents=True, exist_ok=True)
+                with game_log_path.open("a", encoding="utf-8") as file:
+                    file.write(format_selfplay_game(
+                        iteration, game, move_log, final_state, detailed=game == 1))
 
                 replay.add_game(samples)
                 completed_games += 1
@@ -464,6 +520,8 @@ def train(
                     "cpu_threads": torch.get_num_threads(),
                     "tree_reuse": True,
                     "color_plane": game_rules.COLOR_PLANE,
+                    "exploration_moves": exploration_moves,
+                    "win_check": True,
                     "cache_size": 0,
                     "eval_every": eval_every,
                     "eval_games": eval_games,

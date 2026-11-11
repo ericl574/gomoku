@@ -36,6 +36,7 @@ class MCTS:
         noise_fraction=0.25,
         seed=None,
         cache_size=0,
+        win_check=True,
     ):
         if (
             isinstance(simulations, bool)
@@ -66,6 +67,9 @@ class MCTS:
         self.noise_fraction = noise_fraction
         self.rng = np.random.default_rng(seed)
         self.cache_size = cache_size
+        # Win-in-one: a leaf whose player to move can make five right now is a
+        # certain win (+1), decided by the rules alone, without the network.
+        self.win_check = bool(win_check)
         self._cache = OrderedDict()
         self._root = None
         self._root_key = None
@@ -126,6 +130,7 @@ class MCTS:
                 "reused_visits": root.visit_count,
                 "network_calls": 0,
                 "cache_hits": 0,
+                "win_in_one": 0,
             }
             if progress_callback is not None:
                 progress_callback(0, self.simulations)
@@ -159,7 +164,12 @@ class MCTS:
                     simulation_state.step(action)
                     path.append(node)
 
-                value = self._evaluate(simulation_state, node)
+                if self.win_check and simulation_state.has_immediate_win():
+                    # Left unexpanded on purpose: revisits re-check and get +1 again.
+                    value = 1.0
+                    self.last_search_stats["win_in_one"] += 1
+                else:
+                    value = self._evaluate(simulation_state, node)
                 self._backup(path, value)
 
                 completed = simulation + 1

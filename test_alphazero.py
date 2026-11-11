@@ -178,6 +178,88 @@ class SearchTests(unittest.TestCase):
             self.assertTrue(model.training)
 
 
+class FlatNetwork(nn.Module):
+    """Knows nothing: equal priors everywhere, value 0. Isolates what the search finds."""
+
+    def __init__(self):
+        super().__init__()
+        self.anchor = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, x):
+        return torch.zeros(len(x), 361) + self.anchor, torch.zeros(len(x), 1) + self.anchor
+
+
+def brute_force_immediate_win(state):
+    for action in state.legal_actions():
+        trial = state.clone()
+        trial.step(int(action))
+        if trial.winner == state.current_player:
+            return True
+    return False
+
+
+class WinInOneTests(unittest.TestCase):
+    def test_fast_check_matches_brute_force_on_random_boards(self):
+        rng = np.random.default_rng(5)
+        checked = wins = 0
+        for _ in range(300):
+            state = GomokuState()
+            # Dense, clustered random games produce many near-five shapes.
+            for _ in range(int(rng.integers(8, 60))):
+                legal = [int(a) for a in state.legal_actions()
+                         if abs(a // 19 - 9) <= 4 and abs(a % 19 - 9) <= 4]
+                if state.done or not legal:
+                    break
+                state.step(int(rng.choice(legal)))
+            if state.done:
+                continue
+            expected = brute_force_immediate_win(state)
+            self.assertEqual(state.has_immediate_win(), expected)
+            checked += 1
+            wins += expected
+        self.assertGreater(checked, 200)
+        self.assertGreater(wins, 20)  # the test really exercised winning positions
+
+    def test_five_or_more_and_board_edges(self):
+        state = GomokuState()
+        state.board[0, 0:4] = 1          # four at the edge: win at (0, 4)
+        self.assertTrue(state.has_immediate_win())
+        state.board[0, 4] = -1           # blocked: no win
+        self.assertFalse(state.has_immediate_win())
+        state.board[5, [2, 3, 5, 6]] = 1  # split four X X . X X: filling the gap wins
+        self.assertTrue(state.has_immediate_win())
+        state.current_player = -1        # but not for white
+        self.assertFalse(state.has_immediate_win())
+
+    def _closed_four_position(self):
+        state = GomokuState()
+        state.board[9, 5:9] = 1      # black four, left end blocked by white
+        state.board[9, 4] = -1
+        state.board[3, 3] = -1
+        state.board[15, 15] = -1
+        state.current_player = -1    # white must block at (9, 9)
+        return state
+
+    def test_search_blocks_a_four_it_cannot_see_without_the_check(self):
+        block = 9 * 19 + 9
+        with_check = MCTS(FlatNetwork(), simulations=400, win_check=True)
+        policy, _ = with_check.search(self._closed_four_position())
+        self.assertEqual(int(np.argmax(policy)), block)
+        self.assertGreater(policy[block], 0.05)
+        self.assertGreater(with_check.last_search_stats["win_in_one"], 0)
+
+        without = MCTS(FlatNetwork(), simulations=400, win_check=False)
+        policy, _ = without.search(self._closed_four_position())
+        self.assertLess(policy[block], 0.05)  # the old search spreads ~1 visit per move
+
+    def test_own_win_is_still_played(self):
+        state = GomokuState()
+        state.board[9, 5:9] = 1
+        state.board[3, 3:6] = -1
+        policy, _ = MCTS(FlatNetwork(), simulations=400).search(state)
+        self.assertIn(int(np.argmax(policy)), {9 * 19 + 4, 9 * 19 + 9})
+
+
 class IntegrationTests(unittest.TestCase):
     def test_legacy_evaluation_can_disable_tree_reuse(self):
         import evaluate as evaluation

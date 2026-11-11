@@ -11,6 +11,21 @@ import numpy as np
 COLOR_PLANE = False
 
 
+def _five_windows(size=19):
+    """Flat indices of every line of 5 cells: rows, columns, both diagonals."""
+    windows = []
+    for r in range(size):
+        for c in range(size):
+            for dr, dc in ((0, 1), (1, 0), (1, 1), (1, -1)):
+                end_r, end_c = r + 4 * dr, c + 4 * dc
+                if 0 <= end_r < size and 0 <= end_c < size:
+                    windows.append([(r + k * dr) * size + (c + k * dc) for k in range(5)])
+    return np.array(windows, dtype=np.int64)  # 1,020 windows on 19x19
+
+
+FIVE_WINDOWS = _five_windows()
+
+
 class GomokuState:
     def __init__(self):
         self.size = 19
@@ -27,6 +42,20 @@ class GomokuState:
             return np.array([], dtype=np.int64)
 
         return np.flatnonzero(self.board == 0)
+
+    def has_immediate_win(self):
+        """Can the player to move make five (or more) with one stone right now?
+
+        Pure rule check, no strategy: a winning stone always completes some line
+        of 5 cells that already holds 4 of the mover's stones and 1 empty cell,
+        and filling such a line always makes at least five.
+        """
+        if self.done:
+            return False
+        cells = self.board.reshape(-1)[FIVE_WINDOWS]
+        own = (cells == self.current_player).sum(axis=1)
+        empty = (cells == 0).sum(axis=1)
+        return bool(np.any((own == 4) & (empty == 1)))
 
     def step(self, action):
         if self.done:

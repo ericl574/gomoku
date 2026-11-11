@@ -229,6 +229,20 @@ class CheckpointWatchTests(unittest.TestCase):
         self.add_newer("alphazero_bbbb", 3, 5)
         self.assertEqual(game.new_game()["model"]["run"], "alphazero_aaaa")
 
+    def test_best_json_wins_over_newer_files_and_latest_flag_ignores_it(self):
+        from promote import write_best
+        self.add_newer("alphazero_bbbb", 2, 5)  # newer than self.first
+        write_best({"path": str(self.first), "status": "promoted"}, root=self.root)
+        self.assertEqual(CheckpointWatcher(self.root).current()[0], self.first)
+        self.assertIn("BEST (promoted", CheckpointWatcher(self.root).describe())
+        latest = CheckpointWatcher(self.root, use_best=False).current()[0]
+        self.assertEqual(latest.parent.name, "alphazero_bbbb")
+
+    def test_without_best_json_falls_back_to_latest(self):
+        self.add_newer("alphazero_bbbb", 2, 5)
+        self.assertEqual(CheckpointWatcher(self.root).current()[0].parent.name, "alphazero_bbbb")
+        self.assertIn("no best.json yet", CheckpointWatcher(self.root).describe())
+
     @staticmethod
     def free_cell(game):
         board = game.game_state.board
@@ -401,6 +415,51 @@ class LearningModeTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             GomokuGame(model, info, simulations=SIMS, learner=learner,
                        watcher=CheckpointWatcher(self.root))
+
+
+class PromotionTests(unittest.TestCase):
+    def test_decision_needs_enough_games_and_a_clear_score(self):
+        from promote import decide
+        self.assertTrue(decide([1] * 26 + [-1] * 14, 40, 0.6)["promoted"])     # 65% of 40
+        self.assertFalse(decide([1] * 22 + [-1] * 18, 40, 0.6)["promoted"])    # 55%: not clear
+        self.assertFalse(decide([1] * 10, 40, 0.6)["promoted"])                # too few games
+        verdict = decide([1, 0, -1, 1], 4, 0.6)
+        self.assertEqual((verdict["wins"], verdict["draws"], verdict["losses"]), (2, 1, 1))
+        self.assertAlmostEqual(verdict["score"], 0.625)
+
+    def test_match_swaps_colors_on_the_same_opening_and_never_writes_best(self):
+        import promote
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            a = root / "run" / "a.pt"
+            b = root / "run" / "b.pt"
+            save_fake_checkpoint(a, seed=1, iteration=1)
+            save_fake_checkpoint(b, seed=2, iteration=1)
+            calls = []
+            real = promote.play_from_opening
+
+            def spy(candidate, opponent, color, opening, simulations, seed):
+                calls.append((color, tuple(opening)))
+                return real(candidate, opponent, color, opening, simulations, seed)
+
+            with patch.object(promote, "play_from_opening", side_effect=spy):
+                results, lengths = promote.run_match(str(a), str(b), games=4, simulations=2,
+                                                     workers=1, seed=0)
+            self.assertEqual(len(results), 4)
+            self.assertTrue(all(r in (-1, 0, 1) for r in results))
+            self.assertTrue(all(n >= 9 for n in lengths))  # 2 opening stones + a five at least
+            self.assertEqual([c for c, _ in calls], [1, -1, 1, -1])
+            self.assertEqual(calls[0][1], calls[1][1])  # same opening, colors swapped
+            self.assertFalse((root / "best.json").exists())
+
+    def test_best_record_round_trip(self):
+        from promote import read_best, write_best
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertIsNone(read_best(root))
+            write_best({"path": str(root / "x.pt"), "status": "baseline"}, root=root)
+            self.assertEqual(read_best(root)["status"], "baseline")
+            self.assertFalse(list(root.glob("*.tmp")))
 
 
 class ColorBlindTests(unittest.TestCase):
