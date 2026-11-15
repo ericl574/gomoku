@@ -186,6 +186,68 @@ def save_checkpoint(checkpoint, path):
         temporary.unlink(missing_ok=True)
 
 
+def pack_resume_state(model, optimizer, replay, rng, augmentation_rng,
+                      eval_rng, initial_opponent, iteration, games, updates,
+                      color_results, seed, config, run_dir, eval_seeds, initial_source):
+    """Tensor-only replay for safe torch.load(weights_only=True)."""
+    records = list(replay.data)
+    if records:
+        observations = torch.from_numpy(np.stack([x[0] for x in records]).astype(np.float32))
+        policies = torch.from_numpy(np.stack([x[1] for x in records]).astype(np.float32))
+        outcomes = torch.tensor([x[2] for x in records], dtype=torch.float32)
+    else:
+        observations = torch.empty((0, 3, 19, 19), dtype=torch.float32)
+        policies = torch.empty((0, 361), dtype=torch.float32)
+        outcomes = torch.empty((0,), dtype=torch.float32)
+    return {
+        "resume_version": 1,
+        "model_config": config["model_config"],
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "initial_opponent_state_dict": initial_opponent.state_dict(),
+        "replay": (observations, policies, outcomes),
+        "rng_state": rng.bit_generator.state,
+        "augmentation_rng_state": augmentation_rng.bit_generator.state,
+        "eval_rng_state": eval_rng.bit_generator.state,
+        "torch_rng_state": torch.get_rng_state(),
+        "iteration": iteration, "games_completed": games, "updates_completed": updates,
+        "color_results": {int(k): int(v) for k, v in color_results.items()},
+        "seed": seed, "config": config, "run_dir": str(run_dir),
+        "eval_seeds": torch.from_numpy(eval_seeds.copy()),
+        "init_checkpoint": initial_source,
+    }
+
+
+def load_resume_state(path):
+    """Read a trusted local resume file, rejecting mismatched checkpoint formats."""
+    state = torch.load(path, map_location="cpu", weights_only=True)
+    if state.get("resume_version") != 1:
+        raise ValueError("Unsupported or missing resume format")
+    return state
+
+
+def trim_history(path, last_iteration):
+    """Keep only history lines up to the resume point.
+
+    history.jsonl is written before resume_state.bin, so after a crash between
+    the two it can hold rounds (or a half-written line) that will be re-run.
+    Drop those so every round appears exactly once. Atomic replace.
+    """
+    if not path.exists():
+        return
+    kept = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            continue  # half-written line from an interrupted save
+        if record.get("iteration", 0) <= last_iteration:
+            kept.append(line)
+    temporary = path.with_suffix(".jsonl.tmp")
+    temporary.write_text("".join(f"{line}\n" for line in kept), encoding="utf-8")
+    temporary.replace(path)
+
+
 def render_dashboard(progress, status):
     table = Table.grid(padding=(0, 2))
     table.add_column(style="cyan", no_wrap=True)
@@ -216,7 +278,10 @@ def train(
     self_play_workers=1,
     init_checkpoint=None,
     exploration_moves=6,
+    resume_from=None,
 ):
+    if init_checkpoint is not None and resume_from is not None:
+        raise ValueError("Choose init_checkpoint (new run) OR resume_from (same run)")
     # exploration_moves: the first N moves of each self-play game are sampled in
     # proportion to visits (variety); later moves play the most-visited move.
     # AlphaZero used 30 for Go (200+ move games); Gomoku games are ~10-40 moves,
@@ -275,6 +340,7 @@ def train(
         "residual_blocks": 3,
     }
 
+    resume = load_resume_state(resume_from) if resume_from is not None else None
     start = None
     if init_checkpoint is not None:
         # Continue from a saved model (e.g. one taught in web learning mode)
@@ -282,13 +348,34 @@ def train(
         start = torch.load(init_checkpoint, map_location="cpu", weights_only=True)
         model_config = start["model_config"]
 
+    config = {
+        "model_config": model_config,
+        "games_per_iteration": games_per_iteration,
+        "simulations": simulations,
+        "updates_per_iteration": updates_per_iteration,
+        "batch_size": batch_size,
+        "buffer_capacity": buffer_capacity,
+        "learning_rate": learning_rate,
+        "exploration_moves": exploration_moves,
+        "eval_every": eval_every,
+        "eval_games": eval_games,
+    }
+    if resume is not None:
+        model_config = resume["model_config"]
+        config["model_config"] = model_config
+        if resume["config"] != config or resume["seed"] != seed:
+            raise ValueError("Resume configuration or seed differs; use the original parameters")
     model = GomokuNetwork(**model_config)
     if start is not None:
         model.load_state_dict(start["model_state_dict"])
+    if resume is not None:
+        model.load_state_dict(resume["model_state_dict"])
 
     # This opponent stays unchanged throughout the run
     # (the random start, or the loaded model when init_checkpoint is given).
     initial_opponent = deepcopy(model)
+    if resume is not None:
+        initial_opponent.load_state_dict(resume["initial_opponent_state_dict"])
     initial_opponent.eval()
     initial_opponent.requires_grad_(False)
 
@@ -300,17 +387,48 @@ def train(
         optimizer.load_state_dict(start["optimizer_state_dict"])
         for group in optimizer.param_groups:
             group["lr"] = learning_rate  # this run's learning rate wins
+    if resume is not None:
+        eval_seeds = resume["eval_seeds"].numpy().copy()
+        optimizer.load_state_dict(resume["optimizer_state_dict"])
+        for group in optimizer.param_groups:
+            group["lr"] = learning_rate
     replay = ReplayBuffer(buffer_capacity)
+    if resume is not None:
+        obs, pol, val = resume["replay"]
+        if obs.shape[1:] != (3, 19, 19) or pol.shape != (len(obs), 361) or val.shape != (len(obs),):
+            raise ValueError("Invalid replay data in resume state")
+        if len(obs) > buffer_capacity:
+            raise ValueError("Resume replay larger than configured capacity")
+        replay.add_game([(o.numpy().copy(), p.numpy().copy(), float(v))
+                         for o, p, v in zip(obs, pol, val)])
+        rng.bit_generator.state = resume["rng_state"]
+        augmentation_rng.bit_generator.state = resume["augmentation_rng_state"]
+        eval_rng.bit_generator.state = resume["eval_rng_state"]
+        torch.set_rng_state(resume["torch_rng_state"])
+
+    initial_source = (resume.get('init_checkpoint') if resume is not None
+                      else (str(init_checkpoint) if init_checkpoint is not None else None))
 
     # Readable run name: start time + search budget, e.g. 2026-11-10_1230_sims512.
     run_name = f"{datetime.now():%Y-%m-%d_%H%M}_sims{simulations}"
-    run_dir = Path(__file__).resolve().parent / "checkpoints" / run_name
-    suffix = 2
-    while run_dir.exists():  # two runs started in the same minute
-        run_dir = run_dir.with_name(f"{run_name}-{suffix}")
-        suffix += 1
-    run_dir.mkdir(parents=True, exist_ok=False)
+    if resume is None:
+        run_dir = Path(__file__).resolve().parent / "checkpoints" / run_name
+        suffix = 2
+        while run_dir.exists():  # two runs started in the same minute
+            run_dir = run_dir.with_name(f"{run_name}-{suffix}")
+            suffix += 1
+        run_dir.mkdir(parents=True, exist_ok=False)
+    else:
+        # Use the folder the resume file is in now, so the project can be moved
+        # (e.g. to another machine). The folder name must still match, so a
+        # resume file copied into a different run cannot write into it.
+        resume_path = Path(resume_from).resolve()
+        run_dir = resume_path.parent
+        if resume_path.name != "resume_state.bin" or run_dir.name != Path(resume["run_dir"]).name:
+            raise ValueError("Resume file must be resume_state.bin in its original run directory")
     history_path = run_dir / "history.jsonl"
+    if resume is not None:
+        trim_history(history_path, int(resume["iteration"]))
     # Every self-play game; the first game of each round with full search details.
     game_log_path = (
         Path(__file__).resolve().parent / "game_logs" / f"selfplay_{run_dir.name}.txt"
@@ -319,9 +437,12 @@ def train(
     total_games = iterations * games_per_iteration
     total_updates = iterations * updates_per_iteration
 
-    color_results = {1: 0, -1: 0, 0: 0}
-    completed_games = 0
-    completed_updates = 0
+    color_results = dict(resume["color_results"]) if resume is not None else {1: 0, -1: 0, 0: 0}
+    completed_games = int(resume["games_completed"]) if resume is not None else 0
+    completed_updates = int(resume["updates_completed"]) if resume is not None else 0
+    start_iteration = int(resume["iteration"]) if resume is not None else 0
+    # `iterations` counts rounds in THIS call; round numbers are absolute.
+    final_iteration = start_iteration + iterations
 
     status = {
         "Stage": "Starting",
@@ -333,7 +454,7 @@ def train(
         "Last search": "--",
         "Loss: last batch": "--",
         "Loss: round mean": "--",
-        "Replay buffer": f"0 / {buffer_capacity}",
+        "Replay buffer": f"{len(replay)} / {buffer_capacity}",
         "Self-play B/W/D": "No completed games",
         "Eval vs initial": "Not evaluated yet",
         "Last checkpoint": "--",
@@ -392,7 +513,7 @@ def train(
             status["Current move"] = "--"
             status["Game elapsed"] = "--"
 
-        for iteration in range(1, iterations + 1):
+        for iteration in range(start_iteration + 1, start_iteration + iterations + 1):
             snapshot = deepcopy(model)
             snapshot.eval()
             snapshot.requires_grad_(False)
@@ -401,7 +522,7 @@ def train(
             seeds = [int(rng.integers(0, 2**32)) for _ in range(games_per_iteration)]
             if pool is not None:
                 status["Stage"] = (
-                    f"Round {iteration}/{iterations}: "
+                    f"Round {iteration}/{final_iteration}: "
                     f"self-play on {self_play_workers} workers"
                 )
                 live.update(render_dashboard(progress, status))
@@ -419,7 +540,7 @@ def train(
                     samples, final_state, move_log = next(parallel_games)
                 else:
                     status["Stage"] = (
-                        f"Round {iteration}/{iterations}: "
+                        f"Round {iteration}/{final_iteration}: "
                         f"self-play game {game}/{games_per_iteration}"
                     )
                     live.update(render_dashboard(progress, status))
@@ -466,7 +587,7 @@ def train(
 
             for update in range(1, updates_per_iteration + 1):
                 status["Stage"] = (
-                    f"Round {iteration}/{iterations}: "
+                    f"Round {iteration}/{final_iteration}: "
                     f"update {update}/{updates_per_iteration}"
                 )
 
@@ -514,7 +635,7 @@ def train(
                 "metrics": averages,
                 "evaluation": None,
                 "seed": seed,
-                "init_checkpoint": None if init_checkpoint is None else str(init_checkpoint),
+                "init_checkpoint": initial_source,
                 "simulations": simulations,
                 "runtime_config": {
                     "cpu_threads": torch.get_num_threads(),
@@ -522,6 +643,7 @@ def train(
                     "color_plane": game_rules.COLOR_PLANE,
                     "exploration_moves": exploration_moves,
                     "win_check": True,
+                    "fpu_reduction": 0.2,
                     "cache_size": 0,
                     "eval_every": eval_every,
                     "eval_games": eval_games,
@@ -533,7 +655,7 @@ def train(
             save_checkpoint(checkpoint, checkpoint_path)
             status["Last checkpoint"] = checkpoint_path.name
 
-            if iteration % eval_every == 0 or iteration == iterations:
+            if iteration % eval_every == 0 or iteration == final_iteration:
                 model.eval()
                 results = []
 
@@ -546,7 +668,7 @@ def train(
 
                 for game in range(eval_games):
                     status["Stage"] = (
-                        f"Round {iteration}/{iterations}: "
+                        f"Round {iteration}/{final_iteration}: "
                         f"evaluation game {game + 1}/{eval_games}"
                     )
                     live.update(render_dashboard(progress, status))
@@ -607,8 +729,17 @@ def train(
                 "evaluation": evaluation,
             }
 
+            # History first, then the resume point. A crash in between leaves an
+            # extra history line, which trim_history() removes on resume.
             with history_path.open("a", encoding="utf-8") as file:
                 file.write(json.dumps(record) + "\n")
+            # Atomic replace is the durable resume point. It includes the exact
+            # replay, RNG streams, opponent, optimizer, and model for this round.
+            save_checkpoint(pack_resume_state(
+                model, optimizer, replay, rng, augmentation_rng, eval_rng,
+                initial_opponent, iteration, completed_games, completed_updates,
+                color_results, seed, config, run_dir, eval_seeds, initial_source,
+            ), run_dir / "resume_state.bin")
 
             status["Last checkpoint"] = checkpoint_path.name
             progress.update(round_task, advance=1)

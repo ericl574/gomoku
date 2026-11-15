@@ -3,7 +3,7 @@
 From the `gomoku` project directory, with the `ml` environment active:
 
 ```bash
-python -m web_app.server                      # newest checkpoint, 512 simulations/move
+python -m web_app.server                      # best if configured, else latest; 512 simulations/move
 python -m web_app.server --simulations 128    # faster, weaker
 python -m web_app.server --checkpoint checkpoints/<run>/round_005_games0060.pt   # pin one model
 ```
@@ -16,8 +16,8 @@ Open **http://127.0.0.1:8000** (`--port 8001` if 8000 is busy). Ctrl+C stops it.
 
 ## Which AI you are playing
 
-- By default the server plays the **newest `checkpoints/<run>/*.pt` by file
-  write time**, across all training runs. "Newest" is not necessarily "strongest".
+- By default the server plays **best** from `checkpoints/best.json` if configured,
+  otherwise the newest `checkpoints/<run>/*.pt` by write time. "Newest" is not necessarily "strongest".
 - It re-checks at every **New game**. If training has written a newer checkpoint,
   the next game uses it. It never swaps models in the middle of a game.
   You can leave the server running while `train()` runs.
@@ -29,7 +29,7 @@ Open **http://127.0.0.1:8000** (`--port 8001` if 8000 is busy). Ctrl+C stops it.
 ## Learning mode (`--learn`)
 
 ```bash
-python -m web_app.server --learn                       # start from the newest checkpoint
+python -m web_app.server --learn                       # start from best if configured, otherwise latest
 python -m web_app.server --learn --checkpoint <file>   # start from a chosen one
 ```
 
@@ -53,14 +53,14 @@ To hand the taught model to self-play later:
 
 ## How the AI moves
 
-AI is black and opens; you are white. Each AI move runs the same `MCTS` as
+Normal play: AI is black and opens. In learning mode, AI alternates black and white each new game. Each AI move runs the same `MCTS` as
 training and evaluation (`mcts.py`), with no Dirichlet noise, and plays the
 most-visited move (ties are broken at random, as in `evaluate.py`). The search
 tree is reused across moves. Rules come from `state.py`, the same rules training
 uses: five or more in a row wins; a full board is a draw.
 
 Inference is CPU-only with gradients off and one PyTorch thread, so it leaves
-cores for a training run. Checkpoints are only read, never written.
+cores for a training run. Normal play only reads checkpoints. `--learn` writes a new checkpoint after every finished game.
 One shared game lives in memory; refreshing a tab reconnects to it.
 
 ## Tests
@@ -68,3 +68,6 @@ One shared game lives in memory; refreshing a tab reconnects to it.
 ```bash
 python -B -m unittest -v test_web_app
 ```
+
+Legacy saved human-game samples are normalized to the current color-plane encoding
+when loaded; original `.npz` files are left unchanged.

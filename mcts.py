@@ -37,6 +37,7 @@ class MCTS:
         seed=None,
         cache_size=0,
         win_check=True,
+        fpu_reduction=0.2,
     ):
         if (
             isinstance(simulations, bool)
@@ -53,6 +54,10 @@ class MCTS:
 
         if not 0 <= noise_fraction <= 1:
             raise ValueError("Noise fraction must be between 0 and 1")
+        if not math.isfinite(fpu_reduction) or fpu_reduction < 0:
+            raise ValueError("FPU reduction must be nonnegative and finite")
+        # 0.2 is KataGo's value (Wu 2019, "Accelerating Self-Play Learning in Go").
+        self.fpu_reduction = float(fpu_reduction)
         if (
             isinstance(cache_size, bool)
             or not isinstance(cache_size, int)
@@ -160,7 +165,10 @@ class MCTS:
                 path = [node]
 
                 while node.children and not simulation_state.done:
-                    action, node = self._select(node)
+                    # KataGo: no FPU reduction at a noised root, so the
+                    # Dirichlet noise can still steer exploration there.
+                    action, node = self._select(
+                        node, 0.0 if (add_noise and node is root) else None)
                     simulation_state.step(action)
                     path.append(node)
 
@@ -193,23 +201,43 @@ class MCTS:
         finally:
             self.model.train(was_training)
 
-    def _select(self, node):
-        sqrt_visits = math.sqrt(node.visit_count + 1)
+    def _select(self, node, fpu_reduction=None):
+        """PUCT with first-play urgency (FPU) reduction, as in Leela Zero / KataGo.
 
-        def score(item):
-            _, child = item
+        An unvisited child is valued at the parent's value minus
+        fpu_reduction * sqrt(prior mass of already-visited children), i.e.
+        "probably a bit worse than what we have", not 0 (a draw). With 0, a
+        side that thinks it is losing (visited q < 0) rates every unvisited
+        move above its real candidates and spreads its search over the whole
+        board, one visit each.
+        """
+        if fpu_reduction is None:
+            fpu_reduction = self.fpu_reduction
+        exploration_scale = self.c_puct * math.sqrt(node.visit_count + 1)
 
-            exploitation = -child.q
-            exploration = (
-                self.c_puct
-                * child.prior
-                * sqrt_visits
-                / (1 + child.visit_count)
-            )
+        visited_prior = 0.0
+        for child in node.children.values():
+            if child.visit_count:
+                visited_prior += child.prior
+        # node.q is from the mover's side at `node`, the same side as -child.q.
+        # Values live in [-1, 1]: an unexplored move is never rated below a
+        # certain loss, so when every tried move loses, untried ones get looked at.
+        fpu_value = max(-1.0, node.q - fpu_reduction * math.sqrt(visited_prior))
 
-            return exploitation + exploration
-
-        return max(node.children.items(), key=score)
+        best_item = None
+        best_score = -math.inf
+        for item in node.children.items():
+            child = item[1]
+            if child.visit_count:
+                score = -child.q + exploration_scale * child.prior / (1 + child.visit_count)
+            else:
+                score = fpu_value + exploration_scale * child.prior
+            # First maximum wins, like max(); with NaN scores (a broken network)
+            # the first child is returned, as before, and callers detect the NaN.
+            if best_item is None or score > best_score:
+                best_item = item
+                best_score = score
+        return best_item
 
     def _evaluate(self, state, node):
         if state.done:

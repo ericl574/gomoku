@@ -43,16 +43,37 @@ class SearchTests(unittest.TestCase):
                 child.visit_count = int(rng.integers(0, 20))
                 child.value_sum = float(rng.uniform(-1, 1) * child.visit_count)
                 root.children[action] = child
+            root.value_sum = float(rng.uniform(-1, 1) * root.visit_count)
+            visited = sum(c.prior for c in root.children.values() if c.visit_count)
+            fpu = root.q - searcher.fpu_reduction * np.sqrt(visited)
             expected = max(
                 root.children.items(),
                 key=lambda item: (
-                    -item[1].q
+                    (-item[1].q if item[1].visit_count else fpu)
                     + searcher.c_puct * item[1].prior
                     * np.sqrt(root.visit_count + 1)
                     / (1 + item[1].visit_count)
                 ),
             )
             self.assertEqual(searcher._select(root)[0], expected[0])
+
+    def test_losing_side_does_not_spread_search_to_unvisited_moves(self):
+        # Mover thinks it is losing: every visited reply scores about -0.6.
+        # With unvisited moves valued 0 (old behaviour), the next visit went to
+        # an unvisited low-prior move; with FPU it stays on a real candidate.
+        searcher = MCTS(CountingNetwork())
+        root = TreeNode()
+        root.visit_count, root.value_sum = 100, -60.0
+        for action in range(300):
+            root.children[action] = TreeNode(0.5 if action < 2 else 0.5 / 1000)
+        for action in (0, 1):
+            root.children[action].visit_count = 50
+            root.children[action].value_sum = 0.6 * 50  # child side: +0.6
+        self.assertIn(searcher._select(root)[0], (0, 1))
+        old = max(root.children.items(), key=lambda item: (
+            -item[1].q + searcher.c_puct * item[1].prior
+            * np.sqrt(root.visit_count + 1) / (1 + item[1].visit_count)))
+        self.assertNotIn(old[0], (0, 1))  # the old rule did spread
 
     def test_reuse_retains_statistics_and_adds_exact_budget(self):
         state = GomokuState()
@@ -252,12 +273,32 @@ class WinInOneTests(unittest.TestCase):
         policy, _ = without.search(self._closed_four_position())
         self.assertLess(policy[block], 0.05)  # the old search spreads ~1 visit per move
 
-    def test_own_win_is_still_played(self):
+    def _own_win_position(self):
         state = GomokuState()
         state.board[9, 5:9] = 1
         state.board[3, 3:6] = -1
-        policy, _ = MCTS(FlatNetwork(), simulations=400).search(state)
-        self.assertIn(int(np.argmax(policy)), {9 * 19 + 4, 9 * 19 + 9})
+        return state
+
+    def test_own_win_is_still_played(self):
+        wins = {9 * 19 + 4, 9 * 19 + 9}
+        # Without FPU reduction a know-nothing network still finds the win:
+        # the search itself values a five correctly.
+        policy, _ = MCTS(FlatNetwork(), simulations=400, fpu_reduction=0.0).search(
+            self._own_win_position())
+        self.assertIn(int(np.argmax(policy)), wins)
+
+        # Known FPU trade-off (as in Leela Zero / KataGo): the default search
+        # relies on the policy prior to try a move at all. A modest prior on the
+        # winning cells (~5% each) is enough.
+        class HintNetwork(FlatNetwork):
+            def forward(self, x):
+                logits, value = super().forward(x)
+                logits = logits.clone()
+                logits[:, list(wins)] += 3.0
+                return logits, value
+
+        policy, _ = MCTS(HintNetwork(), simulations=400).search(self._own_win_position())
+        self.assertIn(int(np.argmax(policy)), wins)
 
 
 class IntegrationTests(unittest.TestCase):
@@ -331,7 +372,8 @@ class IntegrationTests(unittest.TestCase):
             return 1, 9
 
         def capture(checkpoint, path):
-            event_order.append(("save", checkpoint["iteration"], checkpoint["evaluation"] is None))
+            # resume_state has no "evaluation" key; it counts as an unevaluated save.
+            event_order.append(("save", checkpoint["iteration"], checkpoint.get("evaluation") is None))
 
         with (
             patch.object(training.Path, "mkdir"),
@@ -347,8 +389,9 @@ class IntegrationTests(unittest.TestCase):
             training.train(iterations=2, simulations=2, updates_per_iteration=1, eval_games=2)
         self.assertEqual(matches.call_count, 2)
         self.assertEqual(event_order, [
-            ("save", 1, True), ("save", 2, True),
-            "eval", "eval", ("save", 2, False),
+            ("save", 1, True), ("save", 1, True),
+            ("save", 2, True), "eval", "eval", ("save", 2, False),
+            ("save", 2, True),
         ])
 
     def test_failed_checkpoint_write_keeps_previous_file(self):

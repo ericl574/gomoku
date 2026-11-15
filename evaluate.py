@@ -232,10 +232,18 @@ def main():
     candidate, checkpoint = load_model(args.checkpoint)
 
     if args.opponent is None:
+        if checkpoint.get("init_checkpoint") is not None:
+            parser.error("This run started from a checkpoint; specify --opponent explicitly")
+        if checkpoint.get("runtime_config", {}).get("mode") == "web_learning":
+            parser.error("Web-learning checkpoint: specify --opponent explicitly")
+        if "seed" not in checkpoint:
+            parser.error("Checkpoint has no initial-model seed; specify --opponent explicitly")
+        # train() draws the initial model after torch.manual_seed(seed).
+        # No random torch operations may be inserted before that initialization.
         torch.manual_seed(checkpoint["seed"])
         opponent = GomokuNetwork(**checkpoint["model_config"])
         opponent.eval()
-        opponent_name = "Initial random-weight network"
+        opponent_name = "Reconstructed random initial network (same seed and architecture)"
     else:
         opponent, _ = load_model(args.opponent)
         opponent_name = str(args.opponent)

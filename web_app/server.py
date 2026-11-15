@@ -100,6 +100,33 @@ class CheckpointWatcher:
         return "LATEST checkpoint (no best.json yet), checked again at each new game"
 
 
+def normalized_web_game(observations, policies, outcomes):
+    """Return validated, current-format samples; leave the saved NPZ unchanged.
+
+    Old web games used a color plane. The current network uses COLOR_PLANE=False.
+    Never normalize the two stone planes or rewrite the original game archive.
+    """
+    observations = np.asarray(observations, dtype=np.float32)
+    policies = np.asarray(policies, dtype=np.float32)
+    outcomes = np.asarray(outcomes, dtype=np.float32)
+    n = len(observations)
+    if observations.shape != (n, 3, 19, 19) or policies.shape != (n, 361) or outcomes.shape != (n,):
+        raise ValueError("Invalid saved web game sample shapes")
+    if not (np.isfinite(observations).all() and np.isfinite(policies).all() and np.isfinite(outcomes).all()):
+        raise ValueError("Non-finite saved web game samples")
+    if not (np.isin(observations, (0.0, 1.0)).all()
+            and np.all((observations[:, 0] + observations[:, 1]) <= 1)):
+        raise ValueError("Invalid saved board encoding")
+    if (np.any(policies < 0) or np.any(policies.sum(axis=1) > 1 + 1e-3) or np.any(policies.sum(axis=1) <= 0)
+            or np.any(np.abs(outcomes) > 1)):
+        # Human imitation targets may have a policy sum below 1, so check those separately.
+        raise ValueError("Invalid saved policy or outcome")
+    normalized = observations.copy()
+    if not game_rules.COLOR_PLANE:
+        normalized[:, 2] = 0.0
+    return list(zip(normalized, policies.copy(), outcomes.tolist()))
+
+
 class WebLearner:
     """Learning mode: the AI trains on every finished game it plays against you.
 
@@ -131,6 +158,8 @@ class WebLearner:
         if "optimizer_state_dict" in checkpoint:
             # Continue the same Adam moments the checkpoint was trained with.
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        for group in self.optimizer.param_groups:
+            group["lr"] = learning_rate
         self.updates_completed = int(checkpoint.get("updates_completed") or 0)
         self.source = f"{source_path.parent.name}/{source_path.name}"
         self.simulations = simulations
@@ -154,8 +183,8 @@ class WebLearner:
                 self.skipped_games += 1
                 continue
             with np.load(path) as game:
-                self.buffer.add_game(list(zip(
-                    game["observations"], game["policies"], game["outcomes"].tolist())))
+                self.buffer.add_game(normalized_web_game(
+                    game["observations"], game["policies"], game["outcomes"]))
         self.run_dir = None  # created when the first game finishes
         self.games = 0
         self.last = None

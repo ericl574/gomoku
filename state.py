@@ -44,8 +44,8 @@ class GomokuState:
         return np.flatnonzero(self.board == 0)
 
     def has_immediate_win(self):
-        """Can the player to move make five (or more) with one stone right now?
-
+        """
+        Can the player to move make five (or more) with one stone right now?
         Pure rule check, no strategy: a winning stone always completes some line
         of 5 cells that already holds 4 of the mover's stones and 1 empty cell,
         and filling such a line always makes at least five.
