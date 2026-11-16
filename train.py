@@ -1,4 +1,5 @@
 import json
+import secrets
 import multiprocessing as mp
 from collections import deque
 from concurrent.futures import ProcessPoolExecutor
@@ -24,6 +25,7 @@ from rich.table import Table
 from evaluate import play_match
 from network import GomokuNetwork
 from self_play import play_game
+from human_games import load_human_games
 import state as game_rules
 
 
@@ -33,6 +35,9 @@ class ReplayBuffer:
             raise ValueError("Buffer capacity must be positive")
 
         self.data = deque(maxlen=capacity)
+        # Human games (human_games.py): kept for good, never evicted, and not
+        # counted in len(); sample() mixes them in at a fixed fraction.
+        self.fixed = []
 
     def __len__(self):
         return len(self.data)
@@ -40,25 +45,37 @@ class ReplayBuffer:
     def add_game(self, samples):
         self.data.extend(samples)
 
-    def sample(self, batch_size, rng, augmentation_rng=None):
+    def add_fixed(self, samples):
+        self.fixed.extend(samples)
+
+    def sample(self, batch_size, rng, augmentation_rng=None, fixed_fraction=0.0):
         if not 1 <= batch_size <= len(self):
             raise ValueError("Invalid batch size")
 
         if augmentation_rng is None:
             augmentation_rng = rng
 
+        # On average fixed_fraction of the batch comes from the fixed (human)
+        # samples. With none, rng use is exactly as before (no extra draws).
+        fixed_count = 0
+        if fixed_fraction > 0 and self.fixed:
+            fixed_count = min(int(rng.binomial(batch_size, fixed_fraction)), len(self.fixed))
+
         indices = rng.choice(
             len(self),
-            size=batch_size,
+            size=batch_size - fixed_count,
             replace=False,
         )
+        items = [self.data[int(index)] for index in indices]
+        if fixed_count:
+            items += [self.fixed[int(index)] for index in
+                      rng.choice(len(self.fixed), size=fixed_count, replace=False)]
 
         observations = []
         policies = []
         outcomes = []
 
-        for index in indices:
-            observation, policy, outcome = self.data[int(index)]
+        for observation, policy, outcome in items:
 
             turns = int(augmentation_rng.integers(0, 4))
             mirror = bool(augmentation_rng.integers(0, 2))
@@ -226,6 +243,40 @@ def load_resume_state(path):
     return state
 
 
+def checkpoint_root():
+    """<project>/checkpoints (read at call time, so tests can redirect it)."""
+    return Path(__file__).resolve().parent / "checkpoints"
+
+
+def find_latest_checkpoint(root=None):
+    """Newest .pt by write time across every training run folder.
+
+    Matches new round_NNN_gamesNNNN.pt and old iteration_NNN.pt names alike.
+    save_checkpoint writes `*.pt.tmp` first and renames it, so a file
+    matching this pattern is always complete.
+    """
+    root = checkpoint_root() if root is None else Path(root)
+    candidates = []
+    for path in root.glob("*/*.pt"):
+        try:
+            candidates.append((path.stat().st_mtime_ns, str(path), path))
+        except OSError:
+            continue
+    if not candidates:
+        raise FileNotFoundError(f"No .pt checkpoints under {root}/<run>/")
+    return max(candidates)[2]
+
+
+def replay_samples(replay_tensors, capacity):
+    """(observations, policies, outcomes) tensors from a resume state -> samples."""
+    obs, pol, val = replay_tensors
+    if obs.shape[1:] != (3, 19, 19) or pol.shape != (len(obs), 361) or val.shape != (len(obs),):
+        raise ValueError("Invalid replay data in resume state")
+    if len(obs) > capacity:
+        raise ValueError("Resume replay larger than configured capacity")
+    return [(o.numpy().copy(), p.numpy().copy(), float(v)) for o, p, v in zip(obs, pol, val)]
+
+
 def trim_history(path, last_iteration):
     """Keep only history lines up to the resume point.
 
@@ -279,9 +330,24 @@ def train(
     init_checkpoint=None,
     exploration_moves=6,
     resume_from=None,
+    human_fraction=0.0,
+    init_replay_from=None,
 ):
+    """One self-play training run.
+
+    init_checkpoint: warm start a NEW run from a model. init_replay_from: with
+    it, fill the new run's replay from a resume_state.bin (e.g. the previous
+    self-play run), instead of starting empty.
+    resume_from: continue the SAME run exactly (see command.md).
+    human_fraction: average share of each batch drawn from the saved human
+    games (human_games.py); 0 = self-play data only.
+    """
     if init_checkpoint is not None and resume_from is not None:
         raise ValueError("Choose init_checkpoint (new run) OR resume_from (same run)")
+    if init_replay_from is not None and init_checkpoint is None:
+        raise ValueError("init_replay_from only works with init_checkpoint")
+    if not 0.0 <= human_fraction < 1.0:
+        raise ValueError("human_fraction must be in [0, 1)")
     # exploration_moves: the first N moves of each self-play game are sampled in
     # proportion to visits (variety); later moves play the most-visited move.
     # AlphaZero used 30 for Go (200+ move games); Gomoku games are ~10-40 moves,
@@ -359,6 +425,7 @@ def train(
         "exploration_moves": exploration_moves,
         "eval_every": eval_every,
         "eval_games": eval_games,
+        "human_fraction": human_fraction,
     }
     if resume is not None:
         model_config = resume["model_config"]
@@ -393,14 +460,16 @@ def train(
         for group in optimizer.param_groups:
             group["lr"] = learning_rate
     replay = ReplayBuffer(buffer_capacity)
+    if init_replay_from is not None:
+        # Carried-over self-play memory; the deque keeps the newest samples.
+        replay.add_game(replay_samples(load_resume_state(init_replay_from)["replay"],
+                                       float("inf")))
+    human_games = 0
+    if human_fraction > 0:
+        human, human_games, _ = load_human_games(checkpoint_root())
+        replay.add_fixed(human)
     if resume is not None:
-        obs, pol, val = resume["replay"]
-        if obs.shape[1:] != (3, 19, 19) or pol.shape != (len(obs), 361) or val.shape != (len(obs),):
-            raise ValueError("Invalid replay data in resume state")
-        if len(obs) > buffer_capacity:
-            raise ValueError("Resume replay larger than configured capacity")
-        replay.add_game([(o.numpy().copy(), p.numpy().copy(), float(v))
-                         for o, p, v in zip(obs, pol, val)])
+        replay.add_game(replay_samples(resume["replay"], buffer_capacity))
         rng.bit_generator.state = resume["rng_state"]
         augmentation_rng.bit_generator.state = resume["augmentation_rng_state"]
         eval_rng.bit_generator.state = resume["eval_rng_state"]
@@ -412,7 +481,7 @@ def train(
     # Readable run name: start time + search budget, e.g. 2026-11-10_1230_sims512.
     run_name = f"{datetime.now():%Y-%m-%d_%H%M}_sims{simulations}"
     if resume is None:
-        run_dir = Path(__file__).resolve().parent / "checkpoints" / run_name
+        run_dir = checkpoint_root() / run_name
         suffix = 2
         while run_dir.exists():  # two runs started in the same minute
             run_dir = run_dir.with_name(f"{run_name}-{suffix}")
@@ -426,6 +495,13 @@ def train(
         run_dir = resume_path.parent
         if resume_path.name != "resume_state.bin" or run_dir.name != Path(resume["run_dir"]).name:
             raise ValueError("Resume file must be resume_state.bin in its original run directory")
+        # A newer checkpoint elsewhere (e.g. web learning) would be silently
+        # discarded by an exact resume; `python train.py` handles that case.
+        latest = find_latest_checkpoint(run_dir.parent)
+        if latest.parent.resolve() != run_dir.resolve():
+            raise ValueError(
+                f"Newer checkpoint {latest.parent.name}/{latest.name} exists; resuming would "
+                "discard it. Run `python train.py --rounds N` to continue from it instead.")
     history_path = run_dir / "history.jsonl"
     if resume is not None:
         trim_history(history_path, int(resume["iteration"]))
@@ -455,6 +531,8 @@ def train(
         "Loss: last batch": "--",
         "Loss: round mean": "--",
         "Replay buffer": f"{len(replay)} / {buffer_capacity}",
+        "Human games": (f"{human_games} games, {len(replay.fixed)} positions, "
+                        f"~{human_fraction:.0%} of each batch" if human_fraction else "off"),
         "Self-play B/W/D": "No completed games",
         "Eval vs initial": "Not evaluated yet",
         "Last checkpoint": "--",
@@ -595,6 +673,7 @@ def train(
                     actual_batch_size,
                     rng,
                     augmentation_rng=augmentation_rng,
+                    fixed_fraction=human_fraction,
                 )
                 result = train_step(model, optimizer, batch)
                 metrics.append(result)
@@ -644,6 +723,8 @@ def train(
                     "exploration_moves": exploration_moves,
                     "win_check": True,
                     "fpu_reduction": 0.2,
+                    "human_fraction": human_fraction,
+                    "human_positions": len(replay.fixed),
                     "cache_size": 0,
                     "eval_every": eval_every,
                     "eval_games": eval_games,
@@ -720,6 +801,7 @@ def train(
                 "games_completed": completed_games,
                 "updates_completed": completed_updates,
                 "buffer_size": len(replay),
+                "human_positions": len(replay.fixed),
                 "metrics": averages,
                 "self_play": {
                     "black_wins": color_results[1],
@@ -754,5 +836,60 @@ def train(
     return model, replay, run_dir
 
 
+# Settings for `python train.py`. Only used when a NEW run starts; an exact
+# resume always reuses the settings stored in its resume_state.bin.
+SELF_PLAY_SETTINGS = {
+    "games_per_iteration": 6,
+    "simulations": 512,
+    "updates_per_iteration": 50,
+    "batch_size": 64,
+    "eval_games": 2,
+    "eval_every": 1000,
+    # ~10% of each batch from your saved games. With several hundred human
+    # positions vs a 10,000-sample replay, each human position is reused at
+    # roughly the rate of a self-play sample (~0.3-0.5 times per round).
+    "human_fraction": 0.1,
+}
+
+
+def continue_selfplay(rounds, workers=6, start_from=None):
+    """Continue training from wherever the newest checkpoint is.
+
+    - Newest checkpoint is in a self-play run with resume_state.bin: resume that
+      run exactly (same replay, optimizer, random streams).
+    - Otherwise (e.g. newest is a web-learning save), or with start_from: start a
+      new run from that model, carrying over the newest self-play replay memory.
+    """
+    if start_from is None:
+        latest = find_latest_checkpoint()
+        state_path = latest.parent / "resume_state.bin"
+        if state_path.exists():
+            state = load_resume_state(state_path)
+            settings = {k: v for k, v in state["config"].items() if k != "model_config"}
+            print(f"Resuming run {latest.parent.name} exactly", flush=True)
+            return train(iterations=rounds, self_play_workers=workers, seed=state["seed"],
+                         resume_from=state_path, **settings)
+        start_from = latest
+    states = sorted(checkpoint_root().glob("*/resume_state.bin"), key=lambda p: p.stat().st_mtime_ns)
+    carry = states[-1] if states else None
+    print(f"New run from {Path(start_from).parent.name}/{Path(start_from).name}; replay "
+          + (f"carried over from {carry.parent.name}" if carry else "starts empty"), flush=True)
+    return train(iterations=rounds, self_play_workers=workers, seed=secrets.randbelow(2**31),
+                 init_checkpoint=start_from, init_replay_from=carry, **SELF_PLAY_SETTINGS)
+
+
 if __name__ == "__main__":
-    train()
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Self-play training that continues from the newest checkpoint "
+                    "(self-play or web learning). Ctrl+C anytime; run again to continue.")
+    parser.add_argument("--rounds", type=int, required=True,
+                        help="Rounds to run now (each: 6 games + 50 updates)")
+    parser.add_argument("--workers", type=int, default=6, help="Parallel self-play processes")
+    parser.add_argument("--from", dest="start_from", type=Path, default=None,
+                        help="Start a new run from this .pt instead of the newest checkpoint")
+    args = parser.parse_args()
+    if args.rounds < 1 or args.workers < 1:
+        parser.error("rounds and workers must be positive")
+    continue_selfplay(args.rounds, args.workers, args.start_from)

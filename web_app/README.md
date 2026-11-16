@@ -29,7 +29,7 @@ Open **http://127.0.0.1:8000** (`--port 8001` if 8000 is busy). Ctrl+C stops it.
 ## Learning mode (`--learn`)
 
 ```bash
-python -m web_app.server --learn                       # start from best if configured, otherwise latest
+python -m web_app.server --learn                       # continue from the newest checkpoint (self-play or web)
 python -m web_app.server --learn --checkpoint <file>   # start from a chosen one
 ```
 
@@ -45,11 +45,11 @@ learning sessions are reloaded into the replay buffer at startup.
 `--imitate [WEIGHT]` (default 0.5) also turns each of **your** moves into an
 example: the board from your side, your move as the policy target scaled to
 WEIGHT (so it pulls exactly WEIGHT times as hard as one of the AI's own examples),
-and the result from your side. It is a head start (cf. "kickstarting"); self-play
-later uses no human moves, so the copying fades out there.
+and the result from your side. It is a head start (cf. "kickstarting").
 
-To hand the taught model to self-play later:
-`train(..., init_checkpoint="checkpoints/<web run>/round_XXX_gamesXXXX.pt")`.
+To hand the taught model to self-play: stop the server, then `python train.py --rounds N`.
+It starts from the newest checkpoint (this web save), carries over the last
+self-play replay buffer, and keeps reviewing your saved games (~10% of each batch).
 
 ## How the AI moves
 

@@ -18,7 +18,8 @@ from network import GomokuNetwork
 from self_play import select_action
 from state import GomokuState
 import state as game_rules
-from train import ReplayBuffer, save_checkpoint, train_step
+from train import ReplayBuffer, find_latest_checkpoint, save_checkpoint, train_step
+from human_games import CUTOFF_FILE, load_human_games, normalized_web_game, read_cutoff  # noqa: F401
 from promote import read_best
 
 
@@ -26,24 +27,6 @@ APP_DIR = Path(__file__).resolve().parent
 CHECKPOINT_ROOT = APP_DIR.parent / "checkpoints"
 GAME_LOG_DIR = APP_DIR.parent / "game_logs"
 DEFAULT_SIMULATIONS = 512
-
-
-def find_latest_checkpoint(root=CHECKPOINT_ROOT):
-    """Newest .pt by write time across every training run folder.
-
-    Matches new round_NNN_gamesNNNN.pt and old iteration_NNN.pt names alike.
-    train.save_checkpoint writes `*.pt.tmp` first and renames it, so a file
-    matching this pattern is always complete.
-    """
-    candidates = []
-    for path in Path(root).glob("*/*.pt"):
-        try:
-            candidates.append((path.stat().st_mtime_ns, str(path), path))
-        except OSError:
-            continue
-    if not candidates:
-        raise FileNotFoundError(f"No .pt checkpoints under {root}/<run>/")
-    return max(candidates)[2]
 
 
 def load_model(path):
@@ -100,33 +83,6 @@ class CheckpointWatcher:
         return "LATEST checkpoint (no best.json yet), checked again at each new game"
 
 
-def normalized_web_game(observations, policies, outcomes):
-    """Return validated, current-format samples; leave the saved NPZ unchanged.
-
-    Old web games used a color plane. The current network uses COLOR_PLANE=False.
-    Never normalize the two stone planes or rewrite the original game archive.
-    """
-    observations = np.asarray(observations, dtype=np.float32)
-    policies = np.asarray(policies, dtype=np.float32)
-    outcomes = np.asarray(outcomes, dtype=np.float32)
-    n = len(observations)
-    if observations.shape != (n, 3, 19, 19) or policies.shape != (n, 361) or outcomes.shape != (n,):
-        raise ValueError("Invalid saved web game sample shapes")
-    if not (np.isfinite(observations).all() and np.isfinite(policies).all() and np.isfinite(outcomes).all()):
-        raise ValueError("Non-finite saved web game samples")
-    if not (np.isin(observations, (0.0, 1.0)).all()
-            and np.all((observations[:, 0] + observations[:, 1]) <= 1)):
-        raise ValueError("Invalid saved board encoding")
-    if (np.any(policies < 0) or np.any(policies.sum(axis=1) > 1 + 1e-3) or np.any(policies.sum(axis=1) <= 0)
-            or np.any(np.abs(outcomes) > 1)):
-        # Human imitation targets may have a policy sum below 1, so check those separately.
-        raise ValueError("Invalid saved policy or outcome")
-    normalized = observations.copy()
-    if not game_rules.COLOR_PLANE:
-        normalized[:, 2] = 0.0
-    return list(zip(normalized, policies.copy(), outcomes.tolist()))
-
-
 class WebLearner:
     """Learning mode: the AI trains on every finished game it plays against you.
 
@@ -172,19 +128,12 @@ class WebLearner:
         # Games from earlier learning sessions stay in the replay buffer, except
         # those before the cutoff that --fresh records (run names start with
         # their start time, so they sort in time order).
-        cutoff_file = self.root / "web_buffer_start.txt"
         if fresh:
             self.root.mkdir(parents=True, exist_ok=True)
-            cutoff_file.write_text(f"{datetime.now():%Y-%m-%d_%H%M}\n")
-        self.cutoff = cutoff_file.read_text().strip() if cutoff_file.exists() else ""
-        self.skipped_games = 0
-        for path in sorted(self.root.glob("*_web_*/game_*.npz")):
-            if path.parent.name[:len(self.cutoff)] < self.cutoff:
-                self.skipped_games += 1
-                continue
-            with np.load(path) as game:
-                self.buffer.add_game(normalized_web_game(
-                    game["observations"], game["policies"], game["outcomes"]))
+            (self.root / CUTOFF_FILE).write_text(f"{datetime.now():%Y-%m-%d_%H%M}\n")
+        self.cutoff = read_cutoff(self.root)
+        samples, _, self.skipped_games = load_human_games(self.root)
+        self.buffer.add_game(samples)
         self.run_dir = None  # created when the first game finishes
         self.games = 0
         self.last = None
@@ -644,7 +593,8 @@ def main():
     parser.add_argument("--latest", action="store_true",
                         help="Use the newest checkpoint instead of the best model")
     parser.add_argument("--learn", action="store_true",
-                        help="Learning mode: the AI trains on every finished game against you")
+                        help="Learning mode: continue from the newest checkpoint and train "
+                             "on every finished game against you")
     parser.add_argument("--learn-updates", type=int, default=10,
                         help="Gradient updates after each finished game (default %(default)s)")
     parser.add_argument("--imitate", type=float, nargs="?", const=0.5, default=0.0,
@@ -672,8 +622,9 @@ def main():
     try:
         if args.learn:
             # Start from one checkpoint, then keep training that same model.
-            # Learning continues from: --checkpoint > best > latest (or latest with --latest).
-            path, _ = CheckpointWatcher(pinned=args.checkpoint, use_best=not args.latest).current()
+            # Learning continues the newest training (self-play or web) so the two
+            # modes can alternate: --checkpoint > latest. Never starts from best.
+            path, _ = CheckpointWatcher(pinned=args.checkpoint, use_best=False).current()
             model, info = load_model(path)
             learner = WebLearner(model, path, args.simulations, updates=args.learn_updates,
                                  imitate_weight=args.imitate, fresh=args.fresh)

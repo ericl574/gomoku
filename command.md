@@ -9,34 +9,41 @@ cd /Users/ericl/Desktop/projects/gomoku
 
 ---
 
-## 1. 开始新训练（用修好 FPU 的搜索）
-
-从 1000 轮自我对弈的模型出发（它通过了全部战术诊断，best 模型没有）：
+## 1. 让它自己下（自我对弈训练）
 
 ```bash
-caffeinate -i python -c "from train import train; train(iterations=300, games_per_iteration=6, simulations=512, updates_per_iteration=50, batch_size=64, eval_games=2, eval_every=1000, self_play_workers=6, init_checkpoint='checkpoints/2026-11-11_0023_sims512/round_1000_games6000.pt')"
+caffeinate -i python train.py --rounds 300
 ```
 
-- 开始时会打印 `Run directory: .../checkpoints/<RUN>`，**记下 `<RUN>` 名字**，续训和检查都要用。
-- 修好 FPU 后对局大约长了一倍，每轮大约慢 3 倍：300 轮大约要一整夜（估计值）。
-- 每轮结束都会保存。**随时可以 Ctrl+C**，最多丢掉正在进行的那一轮。之后的 worker 报错可以忽略。
+- **会自动接着上次的训练**：
+  - 上次是自我对弈 → 精确续训同一个 run（经验池、优化器、随机数都恢复）。
+  - 上次是和你下（网页学习）→ 从网页学到的模型开新 run，**并带上上次自我对弈的经验池**。
+- 每轮会复习你的对局：每批训练数据里约 10% 来自你和它下过的棋。
+- `--rounds 300` = **再跑** 300 轮。修好 FPU 后每轮约慢 3 倍，300 轮约一整夜（估计值）。
+- 每轮结束都会保存。**随时可以 Ctrl+C**，最多丢掉正在进行的那一轮；之后的 worker 报错可以忽略。再运行同一条命令就会继续。
 
-## 2. 中断后续训（接着同一个 run）
+**只有第一次**：从 1000 轮模型开始（它通过了全部战术诊断，现在最新的存档是旧的网页模型）：
 
 ```bash
-caffeinate -i python -c "from train import train; train(iterations=300, games_per_iteration=6, simulations=512, updates_per_iteration=50, batch_size=64, eval_games=2, eval_every=1000, self_play_workers=6, resume_from='checkpoints/<RUN>/resume_state.bin')"
+caffeinate -i python train.py --rounds 300 --from checkpoints/2026-11-11_0023_sims512/round_1000_games6000.pt
 ```
 
-- 除 `iterations` 外，**参数必须和第 1 步完全一样**，否则会报错。不要加 `init_checkpoint`。
-- `iterations=300` 表示「**再跑** 300 轮」。
-- 经验池、优化器、随机数都会恢复，和没中断过的结果完全一样。
-- run 文件夹可以随项目移动，但**不能改名**。
-- 忘了 `<RUN>` 名字：`ls -t checkpoints | head -3`
+## 2. 跟它下（网页学习，http://127.0.0.1:8000）
+
+```bash
+python -m web_app.server --learn --imitate 0.7
+```
+
+- **自动接着最新的训练结果**（自我对弈或上次网页学习）。
+- 每下完一局，马上用这局训练并自动保存（成为最新模型）。下次「让它自己下」会从这里接着。
+- `--imitate 0.7`：同时学你的走法（你比它强时很有用）。
+- 你所有的对局都会保存，以后每次网页学习和自我对弈都会复习。
+- **不要和自我对弈同时运行**（它们会各自训练一份模型）。先 Ctrl+C 停掉一个，再开另一个。
 
 ## 3. 检查训练是否健康
 
 ```bash
-RUN=<RUN>; python -c "
+RUN=$(ls -td checkpoints/*_sims512 | grep -v _web_ | head -1 | xargs basename); python -c "
 import json,re,sys
 run=sys.argv[1]; h=[json.loads(l) for l in open(f'checkpoints/{run}/history.jsonl')]
 a=h[max(0,len(h)-51)] if len(h)>50 else None; b=h[-1]['self_play']
@@ -47,7 +54,7 @@ print(f'rounds {len(h)} | last 50 rounds: black wins {bw/(bw+ww):.0%} | policy l
 " $RUN
 ```
 
-和修复前的 1000 轮 run 对比：
+自动检查最新的自我对弈 run（要查别的 run，把 `RUN=$(...)` 换成 `RUN=<run 名字>`）。和修复前的 1000 轮 run 对比：
 
 | 指标 | 修复前（旧搜索） | 希望看到 |
 |---|---|---|
@@ -67,16 +74,15 @@ python promote.py
 - 每次结果都记在 `checkpoints/promotions.jsonl`。
 - 指定某个模型：`python promote.py --candidate checkpoints/<RUN>/round_NNN_gamesNNNN.pt`
 
-## 5. 网页对战 (http://127.0.0.1:8000)
+## 5. 只下棋、不学习（网页）
 
-| 命令 | 用哪个模型 | 会从你的棋里学习吗？ |
-|---|---|---|
-| `python -m web_app.server` | **best**（每局新游戏重新检查） | 不会；训练时可以同时开 |
-| `python -m web_app.server --latest` | **最新**存档 | 不会；训练时可以同时开 |
-| `python -m web_app.server --learn --imitate 0.7` | 从 best 开始 | **会**；它的存档会变成最新模型 |
+| 命令 | 用哪个模型 |
+|---|---|
+| `python -m web_app.server` | **best**（每局新游戏重新检查） |
+| `python -m web_app.server --latest` | **最新**存档 |
 
-- **不要同时运行 `--learn` 和自我对弈训练**，它们各自训练自己的一份模型。
-- 任何一个命令都可以加 `--checkpoint <file.pt>` 指定模型。
+- 不会训练，训练时可以同时开。
+- 都可以加 `--checkpoint <file.pt>` 指定模型。
 
 ## 6. 战术诊断（只读：会不会堵四、会不会一步胜）
 
@@ -96,7 +102,9 @@ python -B -m unittest test_alphazero test_maintenance test_web_app
 
 ## 参考
 
-- **`init_checkpoint` vs `resume_from`**：`init_checkpoint` = 新开一个 run（经验池清空，随机数重新开始）；`resume_from` = 接着同一个 run。
+- **`python train.py` 内部做什么**：精确续训用 `resume_from`（参数必须和原 run 一样，自动读取）；从别的模型开新 run 用 `init_checkpoint`（并用 `init_replay_from` 带上经验池）。如果有更新的存档（比如网页学习），程序会拒绝直接 `resume_from`，以免丢掉它。
+- **run 文件夹**可以随项目移动，但**不能改名**。
+- **你的对局**存在 `checkpoints/*_web_*/game_*.npz`。`checkpoints/web_buffer_start.txt` 之前的对局不会被使用（由 `--learn --fresh` 设置）。
 - **latest vs best**：latest 是最新的 `.pt` 存档（自我对弈或网页学习都算）；best 只能由 `promote.py` 改变（记录在 `checkpoints/best.json`）。最新不等于最强。
 - **`evaluate.py`**：对从存档开始训练的 run 或网页学习的模型，必须加 `--opponent <file.pt>`。
 - **重设 best（一般不需要）**：`python promote.py --set-baseline <file.pt>`
