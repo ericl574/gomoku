@@ -391,6 +391,20 @@ class LearningModeTests(unittest.TestCase):
         for _ in range(3):
             self.assertEqual(game.new_game()["ai_color"], "black")
 
+    def test_play_only_ai_color_white_and_alternate(self):
+        white = GomokuGame(FixedPrior(), {"run": "fake"}, simulations=SIMS, seed=0, ai_color="white")
+        for _ in range(2):
+            snapshot = white.state()
+            self.assertEqual((snapshot["ai_color"], snapshot["turn"]), ("white", "black"))
+            self.assertEqual(len(white.moves), 0)  # the human (black) moves first
+            white.play_human(9, 9, snapshot["revision"])
+            self.assertEqual(len(white.moves), 2)  # the AI answered as white
+            white.new_game()
+        alternate = GomokuGame(FixedPrior(), {"run": "fake"}, simulations=SIMS, seed=0,
+                               ai_color="alternate")
+        colors = [alternate.state()["ai_color"]] + [alternate.new_game()["ai_color"] for _ in range(3)]
+        self.assertEqual(colors, ["black", "white", "black", "white"])
+
     def test_unfinished_game_is_not_learned(self):
         game, model = self.make_game()
         game.play_human(*map(int, np.argwhere(game.game_state.board == 0)[-1]), game.revision)

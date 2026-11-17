@@ -42,6 +42,7 @@ h1 { font-family: Georgia, "Times New Roman", serif; font-size: clamp(30px, 3.6v
 .intersection.last-move .stone.white::after { background: var(--green); }
 .intersection.winning .stone { outline: 2px solid #fff6cc; outline-offset: 1px; }
 @media (hover: hover) { .intersection:not(:disabled):hover::after { content: ""; width: 78%; aspect-ratio: 1; border-radius: 50%; background: #fffef8aa; box-shadow: 0 0 0 1px #fff8; position: absolute; } }
+@media (hover: hover) { #board[data-human="black"] .intersection:not(:disabled):hover::after { background: #1f1d1a99; box-shadow: 0 0 0 1px #0003; } }
 .board-help { color: #8d8e7d; font-size: 11px; margin: 17px 0 0; line-height: 1.6; text-align: center; }
 .board-help > span { font-size: 14px; padding-right: 4px; }
 .game-panel { padding-top: 25px; }

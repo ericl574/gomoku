@@ -51,16 +51,23 @@ To hand the taught model to self-play: stop the server, then `python train.py --
 It starts from the newest checkpoint (this web save), carries over the last
 self-play replay buffer, and keeps reviewing your saved games (~10% of each batch).
 
+## Saved games outside learning mode
+
+Normal play also saves every finished game to `checkpoints/<time>_web_play/game_NNNN.npz`
+(the AI's moves; add `--imitate W` to save yours too; `--no-save` turns it off).
+Nothing is trained during play. `python train.py` re-labels games the AI did not
+win with a deeper search (`review.py`) and starts some self-play games from their positions.
+
 ## How the AI moves
 
-Normal play: AI is black and opens. In learning mode, AI alternates black and white each new game. Each AI move runs the same `MCTS` as
+Normal play: AI is black and opens (`--ai-color white|alternate` to change). In learning mode, AI alternates black and white each new game. Each AI move runs the same `MCTS` as
 training and evaluation (`mcts.py`), with no Dirichlet noise, and plays the
 most-visited move (ties are broken at random, as in `evaluate.py`). The search
 tree is reused across moves. Rules come from `state.py`, the same rules training
 uses: five or more in a row wins; a full board is a draw.
 
 Inference is CPU-only with gradients off and one PyTorch thread, so it leaves
-cores for a training run. Normal play only reads checkpoints. `--learn` writes a new checkpoint after every finished game.
+cores for a training run. Normal play never writes checkpoints (only saved games). `--learn` writes a new checkpoint after every finished game.
 One shared game lives in memory; refreshing a tab reconnects to it.
 
 ## Tests

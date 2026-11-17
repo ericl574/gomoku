@@ -30,8 +30,14 @@ def play_game(
     seed=None,
     progress_callback=None,
     move_log=None,
+    start_state=None,
 ):
-    """move_log: optional list; one dict per move is appended (for game logs)."""
+    """move_log: optional list; one dict per move is appended (for game logs).
+
+    start_state: play on from this position instead of an empty board
+    (e.g. a position from a game the AI lost to you). Only moves from there
+    on become training samples; exploration_moves counts from there too.
+    """
     if (
         isinstance(exploration_moves, bool)
         or not isinstance(exploration_moves, (int, np.integer))
@@ -47,7 +53,7 @@ def play_game(
         seed=int(rng.integers(0, 2**32)),
     )
 
-    state = GomokuState()
+    state = start_state.clone() if start_state is not None else GomokuState()
     history = []
     started = time.perf_counter()
 

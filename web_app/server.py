@@ -19,7 +19,8 @@ from self_play import select_action
 from state import GomokuState
 import state as game_rules
 from train import ReplayBuffer, find_latest_checkpoint, save_checkpoint, train_step
-from human_games import CUTOFF_FILE, load_human_games, normalized_web_game, read_cutoff  # noqa: F401
+from human_games import (CUTOFF_FILE, load_human_games, normalized_web_game,  # noqa: F401
+                         read_cutoff, save_web_game)
 from promote import read_best
 
 
@@ -83,6 +84,38 @@ class CheckpointWatcher:
         return "LATEST checkpoint (no best.json yet), checked again at each new game"
 
 
+def new_run_dir(root, name):
+    """checkpoints/<name>, or <name>-2, -3, ... if it already exists."""
+    run_dir, suffix = Path(root) / name, 2
+    while run_dir.exists():
+        run_dir, suffix = Path(root) / f"{name}-{suffix}", suffix + 1
+    run_dir.mkdir(parents=True)
+    return run_dir
+
+
+class GameArchive:
+    """Play-only mode: save every finished game for later training (no training now).
+
+    Files go to checkpoints/<time>_web_play/game_NNNN.npz, the same format and
+    place pattern as learning-mode games, so self-play reviews them too.
+    """
+
+    def __init__(self, root=CHECKPOINT_ROOT):
+        self.root = Path(root)
+        self.run_dir = None  # created when the first game finishes
+        self.games = 0
+
+    def save(self, records, winner, ai_player, moves):
+        if not records:
+            return None
+        if self.run_dir is None:
+            self.run_dir = new_run_dir(self.root, f"{datetime.now():%Y-%m-%d_%H%M}_web_play")
+        self.games += 1
+        path = self.run_dir / f"game_{self.games:04d}.npz"
+        save_web_game(path, records, winner, ai_player, moves)
+        return path
+
+
 class WebLearner:
     """Learning mode: the AI trains on every finished game it plays against you.
 
@@ -138,31 +171,20 @@ class WebLearner:
         self.games = 0
         self.last = None
 
-    def _make_run_dir(self):
-        name = f"{datetime.now():%Y-%m-%d_%H%M}_web_sims{self.simulations}"
-        run_dir, suffix = self.root / name, 2
-        while run_dir.exists():
-            run_dir, suffix = self.root / f"{name}-{suffix}", suffix + 1
-        run_dir.mkdir(parents=True)
-        return run_dir
-
-    def learn(self, records, winner, ai_player=1):
+    def learn(self, records, winner, ai_player=1, moves=()):
         """records: (board encoding, policy target, player who moved) per example.
 
         ai_player is the AI's color in this game (1 black, -1 white).
+        moves: every move of the game (actions), saved for review.
         """
-        samples = [(obs, policy, float(winner * player)) for obs, policy, player in records]
-        if not samples:
+        if not records:
             return None
         if self.run_dir is None:
-            self.run_dir = self._make_run_dir()
+            self.run_dir = new_run_dir(
+                self.root, f"{datetime.now():%Y-%m-%d_%H%M}_web_sims{self.simulations}")
         self.games += 1
-        np.savez_compressed(
-            self.run_dir / f"game_{self.games:04d}.npz",
-            observations=np.stack([s[0] for s in samples]),
-            policies=np.stack([s[1] for s in samples]),
-            outcomes=np.array([s[2] for s in samples], dtype=np.float32),
-        )
+        samples = save_web_game(self.run_dir / f"game_{self.games:04d}.npz",
+                                records, winner, ai_player, moves)
         self.buffer.add_game(samples)
 
         batch_size = min(self.batch_size, len(self.buffer))
@@ -216,7 +238,7 @@ class GomokuGame:
     """One shared game against an AI that moves with MCTS.
 
     Both modes: no root noise (the human opponent supplies the variety).
-    Normal mode: the AI is always black.
+    Normal mode: the AI plays ai_color ("black", "white", or "alternate").
     Learning mode: every finished game is
     handed to the WebLearner, and the AI's color alternates each game
     (black, white, black, ...) so both colors win and lose. Otherwise the
@@ -224,11 +246,14 @@ class GomokuGame:
     """
 
     def __init__(self, model=None, info=None, simulations=DEFAULT_SIMULATIONS,
-                 watcher=None, seed=None, learner=None, log_dir=None):
+                 watcher=None, seed=None, learner=None, log_dir=None, ai_color="black",
+                 archive=None, imitate_weight=0.0):
         if model is None and watcher is None:
             raise ValueError("Give a model or a checkpoint watcher")
         if learner is not None and watcher is not None:
             raise ValueError("Learning mode keeps its own model; don't auto-swap checkpoints")
+        if ai_color not in ("black", "white", "alternate"):
+            raise ValueError("ai_color must be black, white, or alternate")
         # Game log: every finished game, every move, and what the AI's search saw.
         self.log_path = (Path(log_dir) / f"{datetime.now():%Y-%m-%d_%H%M%S}.txt"
                          if log_dir is not None else None)
@@ -237,8 +262,14 @@ class GomokuGame:
         self.simulations = simulations
         self.watcher = watcher
         self.learner = learner
-        self.alternate_colors = learner is not None
-        self.ai_player = -1 if self.alternate_colors else 1  # first new_game flips to black
+        if learner is not None and archive is not None:
+            raise ValueError("Learning mode saves its own games; don't add an archive")
+        self.archive = archive  # play-only mode: save finished games, no training
+        # Weight of YOUR moves as examples (--imitate); 0 = only the AI's moves.
+        self.imitate_weight = learner.imitate_weight if learner is not None else imitate_weight
+        self.alternate_colors = learner is not None or ai_color == "alternate"
+        # Alternating: start at white so the first new_game flips to black.
+        self.ai_player = -1 if self.alternate_colors or ai_color == "white" else 1
         self.records = []
         self.rng = np.random.default_rng(seed)
         self.lock = threading.Lock()
@@ -301,7 +332,9 @@ class GomokuGame:
             "learning": ({"enabled": True, "games": self.learner.games,
                           "imitate_weight": self.learner.imitate_weight,
                           "positions": len(self.learner.buffer), "last": self.learner.last}
-                         if self.learner is not None else {"enabled": False}),
+                         if self.learner is not None else
+                         {"enabled": False, "saved_games": self.archive.games}
+                         if self.archive is not None else {"enabled": False}),
         }
 
     def state(self):
@@ -335,7 +368,7 @@ class GomokuGame:
             self.winning_line = self._winning_stones(row, col, player)
 
     def _ai_move(self):
-        learning = self.learner is not None
+        learning = self.learner is not None or self.archive is not None
         # No Dirichlet noise, even when learning: self-play needs it to vary its
         # games, but against you the variety comes from your play. With a flat
         # prior, the noise alone was choosing moves (e.g. random edge openings).
@@ -425,10 +458,27 @@ class GomokuGame:
         except Exception as error:  # noqa: BLE001
             print(f"Writing the game log failed: {error}", file=sys.stderr, flush=True)
 
+    def _actions(self):
+        return [m["row"] * self.game_state.size + m["col"] for m in self.moves]
+
+    def _archive_finished_game(self):
+        """Play-only mode: save the game that just ended. A failure never undoes it."""
+        try:
+            path = self.archive.save(self.records, int(self.game_state.winner),
+                                     self.ai_player, self._actions())
+        except Exception as error:  # noqa: BLE001
+            print(f"Saving this game failed: {error}", file=sys.stderr, flush=True)
+            return
+        self.records = []
+        if path is not None:
+            print(f"Saved for training: {path.parent.name}/{path.name} "
+                  "(lost games are reviewed and replayed by `python train.py`)", flush=True)
+
     def _learn_from_finished_game(self):
         """Train on the game that just ended. A failure never undoes the game."""
         try:
-            path = self.learner.learn(self.records, int(self.game_state.winner), self.ai_player)
+            path = self.learner.learn(self.records, int(self.game_state.winner), self.ai_player,
+                                      self._actions())
         except Exception as error:  # noqa: BLE001
             print(f"Learning from this game failed: {error}", file=sys.stderr, flush=True)
             return
@@ -479,7 +529,7 @@ class GomokuGame:
             return self._snapshot()
 
     def play_human(self, row, col, revision):
-        """Your move (white, or black in learning-mode games where the AI is white)."""
+        """Your move (whichever color the AI is not playing this game)."""
         with self.lock:
             state = self.game_state
             if any(type(value) is not int for value in (row, col, revision)):
@@ -499,10 +549,10 @@ class GomokuGame:
             saved = self._save()
             try:
                 action = row * state.size + col
-                if self.learner is not None and self.learner.imitate_weight > 0:
+                if (self.learner is not None or self.archive is not None) and self.imitate_weight > 0:
                     # Your move as an example, from your side of the board.
                     target = np.zeros(state.size * state.size, dtype=np.float32)
-                    target[action] = self.learner.imitate_weight
+                    target[action] = self.imitate_weight
                     self.records.append((state.encode(), target, state.current_player))
                 self._place(action)
                 self._print_move(len(self.moves) - 1)
@@ -513,6 +563,8 @@ class GomokuGame:
                 raise
             if self.game_state.done and self.learner is not None:
                 self._learn_from_finished_game()
+            if self.game_state.done and self.archive is not None:
+                self._archive_finished_game()
             if self.game_state.done:
                 self._write_game_log()
             self.revision += 1
@@ -592,6 +644,9 @@ def main():
                              "or the newest checkpoint if no best exists yet")
     parser.add_argument("--latest", action="store_true",
                         help="Use the newest checkpoint instead of the best model")
+    parser.add_argument("--ai-color", choices=("black", "white", "alternate"), default=None,
+                        help="Without --learn: the AI's color (default black; "
+                             "alternate = switch every game). --learn always alternates")
     parser.add_argument("--learn", action="store_true",
                         help="Learning mode: continue from the newest checkpoint and train "
                              "on every finished game against you")
@@ -599,8 +654,10 @@ def main():
                         help="Gradient updates after each finished game (default %(default)s)")
     parser.add_argument("--imitate", type=float, nargs="?", const=0.5, default=0.0,
                         metavar="WEIGHT",
-                        help="With --learn: also learn from YOUR moves, weighted "
-                             "(default 0.5 when given; 0 = off)")
+                        help="Also learn from YOUR moves, weighted (default 0.5 when given; "
+                             "0 = off). Without --learn: saved with the game for later training")
+    parser.add_argument("--no-save", action="store_true",
+                        help="Without --learn: don't save finished games for training")
     parser.add_argument("--fresh", action="store_true",
                         help="With --learn: keep the weights, but forget games learned before "
                              "now (later restarts skip them too)")
@@ -613,8 +670,12 @@ def main():
     torch.set_num_threads(1)
     if args.learn_updates < 1:
         parser.error("learn-updates must be positive")
-    if args.imitate and not args.learn:
-        parser.error("--imitate only works together with --learn")
+    if args.no_save and args.learn:
+        parser.error("--learn always saves its games; drop --no-save")
+    if args.imitate and args.no_save:
+        parser.error("--imitate needs saved games; drop --no-save")
+    if args.ai_color and args.learn:
+        parser.error("--learn always alternates colors; drop --ai-color")
     if args.fresh and not args.learn:
         parser.error("--fresh only works together with --learn")
     if not 0.0 <= args.imitate <= 1.0:
@@ -633,7 +694,9 @@ def main():
         else:
             watcher = CheckpointWatcher(pinned=args.checkpoint, use_best=not args.latest)
             game = GomokuGame(simulations=args.simulations, watcher=watcher,
-                              log_dir=GAME_LOG_DIR)
+                              log_dir=GAME_LOG_DIR, ai_color=args.ai_color or "black",
+                              archive=None if args.no_save else GameArchive(),
+                              imitate_weight=args.imitate)
         server = make_server(game, args.port)
     except (OSError, RuntimeError, ValueError, KeyError) as error:
         parser.error(str(error))
@@ -647,7 +710,8 @@ def main():
                    if learner.cutoff else "")
                 + ". Its saves count as LATEST only; only promote.py can change BEST")
     else:
-        mode = watcher.describe()
+        mode = watcher.describe() + ("; games are NOT saved" if args.no_save else
+                                     "; finished games are saved for `python train.py`")
     print(f"Gomoku is ready: http://127.0.0.1:{server.server_port}", flush=True)
     print(f"AI: {game.info['run']}/{game.info['file']} ({mode}), "
           f"{args.simulations} MCTS simulations per move, CPU.", flush=True)

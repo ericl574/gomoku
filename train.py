@@ -25,7 +25,8 @@ from rich.table import Table
 from evaluate import play_match
 from network import GomokuNetwork
 from self_play import play_game
-from human_games import load_human_games
+from human_games import load_human_games, lost_game_positions, state_from_observation
+from review import review_games
 import state as game_rules
 
 
@@ -115,8 +116,12 @@ class ReplayBuffer:
             ).unsqueeze(1),
         )
 
-def self_play_worker(model_config, state_dict, simulations, seed, exploration_moves=6):
-    """One self-play game in a worker process; same game as the serial path."""
+def self_play_worker(model_config, state_dict, simulations, seed, exploration_moves=6,
+                     start=None):
+    """One self-play game in a worker process; same game as the serial path.
+
+    start: board encoding to play on from (None = empty board).
+    """
     torch.set_num_threads(1)
     model = GomokuNetwork(**model_config)
     model.load_state_dict(state_dict)
@@ -125,12 +130,16 @@ def self_play_worker(model_config, state_dict, simulations, seed, exploration_mo
     samples, final_state = play_game(
         model, simulations=simulations, seed=seed, move_log=move_log,
         exploration_moves=exploration_moves,
+        start_state=None if start is None else state_from_observation(start),
     )
     return samples, final_state, move_log
 
 
-def format_selfplay_game(iteration, game, move_log, final_state, detailed):
-    """One self-play game as text. detailed=True adds what the search saw per move."""
+def format_selfplay_game(iteration, game, move_log, final_state, detailed, start=None):
+    """One self-play game as text. detailed=True adds what the search saw per move.
+
+    start: the board encoding a from-your-game game started at (None = empty board).
+    """
     def coord(action):
         return f"{chr(65 + action % 19)}{action // 19 + 1}"  # web board labels
 
@@ -138,7 +147,12 @@ def format_selfplay_game(iteration, game, move_log, final_state, detailed):
         return "B" if player == 1 else "W"
 
     winner = {1: "black won", -1: "white won", 0: "draw"}[int(final_state.winner)]
-    lines = [f"=== Round {iteration} game {game} | {winner} in {len(move_log)} moves"]
+    if start is None:
+        lines = [f"=== Round {iteration} game {game} | {winner} in {len(move_log)} moves"]
+    else:  # worded so the "in N moves" length statistics skip these games
+        stones = int(start[0].sum() + start[1].sum())
+        lines = [f"=== Round {iteration} game {game} | from your game, {stones} stones on the "
+                 f"board | {winner} after {len(move_log)} more moves"]
     if detailed:
         lines.append("value = mover's search estimate (+1 winning); top: n visits, "
                      "p network prior, q mover's estimate; w1 = win-in-one hits")
@@ -332,6 +346,7 @@ def train(
     resume_from=None,
     human_fraction=0.0,
     init_replay_from=None,
+    start_fraction=0.0,
 ):
     """One self-play training run.
 
@@ -341,6 +356,9 @@ def train(
     resume_from: continue the SAME run exactly (see command.md).
     human_fraction: average share of each batch drawn from the saved human
     games (human_games.py); 0 = self-play data only.
+    start_fraction: average share of self-play games that start from a position
+    of a saved game the AI did not win (in a random one of the 8 symmetries),
+    instead of an empty board. These are left out of the black/white counts.
     """
     if init_checkpoint is not None and resume_from is not None:
         raise ValueError("Choose init_checkpoint (new run) OR resume_from (same run)")
@@ -348,6 +366,8 @@ def train(
         raise ValueError("init_replay_from only works with init_checkpoint")
     if not 0.0 <= human_fraction < 1.0:
         raise ValueError("human_fraction must be in [0, 1)")
+    if not 0.0 <= start_fraction < 1.0:
+        raise ValueError("start_fraction must be in [0, 1)")
     # exploration_moves: the first N moves of each self-play game are sampled in
     # proportion to visits (variety); later moves play the most-visited move.
     # AlphaZero used 30 for Go (200+ move games); Gomoku games are ~10-40 moves,
@@ -426,11 +446,13 @@ def train(
         "eval_every": eval_every,
         "eval_games": eval_games,
         "human_fraction": human_fraction,
+        "start_fraction": start_fraction,
     }
     if resume is not None:
         model_config = resume["model_config"]
         config["model_config"] = model_config
-        if resume["config"] != config or resume["seed"] != seed:
+        stored = {"start_fraction": 0.0, **resume["config"]}  # runs saved before it existed
+        if stored != config or resume["seed"] != seed:
             raise ValueError("Resume configuration or seed differs; use the original parameters")
     model = GomokuNetwork(**model_config)
     if start is not None:
@@ -468,6 +490,8 @@ def train(
     if human_fraction > 0:
         human, human_games, _ = load_human_games(checkpoint_root())
         replay.add_fixed(human)
+    # Positions from games you won against it: some self-play games start there.
+    start_positions = lost_game_positions(checkpoint_root()) if start_fraction > 0 else []
     if resume is not None:
         replay.add_game(replay_samples(resume["replay"], buffer_capacity))
         rng.bit_generator.state = resume["rng_state"]
@@ -533,6 +557,9 @@ def train(
         "Replay buffer": f"{len(replay)} / {buffer_capacity}",
         "Human games": (f"{human_games} games, {len(replay.fixed)} positions, "
                         f"~{human_fraction:.0%} of each batch" if human_fraction else "off"),
+        "From your games": (f"{len(start_positions)} positions from games it lost; "
+                            f"~{start_fraction:.0%} of self-play games start there"
+                            if start_positions else "off"),
         "Self-play B/W/D": "No completed games",
         "Eval vs initial": "Not evaluated yet",
         "Last checkpoint": "--",
@@ -598,6 +625,18 @@ def train(
 
             # Same seeds, drawn in the same order, whether serial or parallel.
             seeds = [int(rng.integers(0, 2**32)) for _ in range(games_per_iteration)]
+            # Some games start from a position of a game it lost to you. Drawn only
+            # when there are positions, so other runs use the rng exactly as before.
+            starts = [None] * games_per_iteration
+            if start_fraction > 0 and start_positions:
+                for index in range(games_per_iteration):
+                    if rng.random() < start_fraction:
+                        board = start_positions[int(rng.integers(len(start_positions)))]
+                        board = np.rot90(board, k=int(rng.integers(0, 4)), axes=(1, 2))
+                        if rng.integers(0, 2):
+                            board = np.flip(board, axis=2)
+                        starts[index] = board.copy()
+            position_games = 0
             if pool is not None:
                 status["Stage"] = (
                     f"Round {iteration}/{final_iteration}: "
@@ -611,6 +650,7 @@ def train(
                     repeat(simulations),
                     seeds,
                     repeat(exploration_moves),
+                    starts,
                 )
 
             for game in range(1, games_per_iteration + 1):
@@ -631,29 +671,37 @@ def train(
                         progress_callback=report_search,
                         move_log=move_log,
                         exploration_moves=exploration_moves,
+                        start_state=(None if starts[game - 1] is None
+                                     else state_from_observation(starts[game - 1])),
                     )
 
+                start = starts[game - 1]
                 game_log_path.parent.mkdir(parents=True, exist_ok=True)
                 with game_log_path.open("a", encoding="utf-8") as file:
                     file.write(format_selfplay_game(
-                        iteration, game, move_log, final_state, detailed=game == 1))
+                        iteration, game, move_log, final_state,
+                        detailed=game == 1 or start is not None, start=start))
 
                 replay.add_game(samples)
                 completed_games += 1
-                color_results[final_state.winner] += 1
+                if start is None:  # mid-game starts would skew the black/white balance
+                    color_results[final_state.winner] += 1
+                else:
+                    position_games += 1
 
                 black = color_results[1]
                 white = color_results[-1]
                 draws = color_results[0]
+                counted = max(1, black + white + draws)
 
                 status["Replay buffer"] = (
                     f"{len(replay)} / {buffer_capacity}"
                 )
                 status["Self-play B/W/D"] = (
                     f"{black}/{white}/{draws}; "
-                    f"black {black / completed_games:.1%}, "
-                    f"white {white / completed_games:.1%}, "
-                    f"draw {draws / completed_games:.1%}"
+                    f"black {black / counted:.1%}, "
+                    f"white {white / counted:.1%}, "
+                    f"draw {draws / counted:.1%}"
                 )
 
                 progress.update(game_task, advance=1)
@@ -725,6 +773,8 @@ def train(
                     "fpu_reduction": 0.2,
                     "human_fraction": human_fraction,
                     "human_positions": len(replay.fixed),
+                    "start_fraction": start_fraction,
+                    "start_positions": len(start_positions),
                     "cache_size": 0,
                     "eval_every": eval_every,
                     "eval_games": eval_games,
@@ -802,6 +852,7 @@ def train(
                 "updates_completed": completed_updates,
                 "buffer_size": len(replay),
                 "human_positions": len(replay.fixed),
+                "position_games": position_games,
                 "metrics": averages,
                 "self_play": {
                     "black_wins": color_results[1],
@@ -849,6 +900,9 @@ SELF_PLAY_SETTINGS = {
     # positions vs a 10,000-sample replay, each human position is reused at
     # roughly the rate of a self-play sample (~0.3-0.5 times per round).
     "human_fraction": 0.1,
+    # ~20% of self-play games (about 1 of 6 per round) start from a position of
+    # a game it lost to you, so it practises exactly where it went wrong.
+    "start_fraction": 0.2,
 }
 
 
@@ -857,8 +911,10 @@ def continue_selfplay(rounds, workers=6, start_from=None):
 
     - Newest checkpoint is in a self-play run with resume_state.bin: resume that
       run exactly (same replay, optimizer, random streams).
-    - Otherwise (e.g. newest is a web-learning save), or with start_from: start a
-      new run from that model, carrying over the newest self-play replay memory.
+    - Otherwise (e.g. newest is a web-learning save, or SELF_PLAY_SETTINGS changed
+      since that run started), or with start_from: start a new run from that
+      model, carrying over the newest self-play replay memory.
+    Before training, saved games the AI did not win are reviewed (review.py).
     """
     if start_from is None:
         latest = find_latest_checkpoint()
@@ -866,10 +922,15 @@ def continue_selfplay(rounds, workers=6, start_from=None):
         if state_path.exists():
             state = load_resume_state(state_path)
             settings = {k: v for k, v in state["config"].items() if k != "model_config"}
-            print(f"Resuming run {latest.parent.name} exactly", flush=True)
-            return train(iterations=rounds, self_play_workers=workers, seed=state["seed"],
-                         resume_from=state_path, **settings)
+            if all(settings.get(k) == v for k, v in SELF_PLAY_SETTINGS.items()):
+                review_games(checkpoint_root(), latest, workers)
+                print(f"Resuming run {latest.parent.name} exactly", flush=True)
+                return train(iterations=rounds, self_play_workers=workers, seed=state["seed"],
+                             resume_from=state_path, **settings)
+            print(f"Training settings changed since run {latest.parent.name}; "
+                  "starting a new run from its newest model", flush=True)
         start_from = latest
+    review_games(checkpoint_root(), start_from, workers)
     states = sorted(checkpoint_root().glob("*/resume_state.bin"), key=lambda p: p.stat().st_mtime_ns)
     carry = states[-1] if states else None
     print(f"New run from {Path(start_from).parent.name}/{Path(start_from).name}; replay "

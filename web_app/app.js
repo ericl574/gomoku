@@ -88,6 +88,8 @@ function render() {
   const human = state?.human_color || "white";
   const ai = state?.ai_color || "black";
   const cap = (color) => color[0].toUpperCase() + color.slice(1);
+  board.dataset.human = human; // the hover preview shows your color
+  board.setAttribute("aria-label", `Gomoku board. You play ${human}.`);
   const winning = new Set((state?.winning_line || []).map(([row, col]) => row * 19 + col));
   const last = state?.last_move;
   buttons.forEach((button, index) => {
@@ -121,9 +123,12 @@ function render() {
   modelInfo.title = model ? `${model.run}/${model.file}, ${model.updates ?? "?"} updates, ${model.architecture}. A newer checkpoint loads when you start a new game.` : "";
   const learning = state?.learning;
   const learningInfo = document.getElementById("learning-info");
-  learningInfo.textContent = !learning ? "—" : learning.enabled ? `on${learning.imitate_weight ? ` · copies you ×${learning.imitate_weight}` : ""} · ${learning.games} games` : "off";
+  learningInfo.textContent = !learning ? "—" : learning.enabled ? `on${learning.imitate_weight ? ` · copies you ×${learning.imitate_weight}` : ""} · ${learning.games} games`
+    : learning.saved_games != null ? `later · ${learning.saved_games} games saved` : "off";
   const lastGame = learning?.last;
-  learningInfo.title = lastGame ? `Last game: ${lastGame.result}, ${lastGame.positions} positions. Loss: policy ${lastGame.policy_loss.toFixed(3)}, value ${lastGame.value_loss.toFixed(3)}. Replay: ${lastGame.buffer} positions.` : "";
+  learningInfo.title = learning && !learning.enabled && learning.saved_games != null
+    ? "Not training now. Finished games are saved; `python train.py` learns from them (and reviews the ones it lost)."
+    : lastGame ? `Last game: ${lastGame.result}, ${lastGame.positions} positions. Loss: policy ${lastGame.policy_loss.toFixed(3)}, value ${lastGame.value_loss.toFixed(3)}. Replay: ${lastGame.buffer} positions.` : "";
 
   let title = "Your turn.";
   let description = `Find an empty intersection and place your ${human} stone.`;
