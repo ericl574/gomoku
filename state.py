@@ -57,6 +57,34 @@ class GomokuState:
         empty = (cells == 0).sum(axis=1)
         return bool(np.any((own == 4) & (empty == 1)))
 
+    def winning_moves(self):
+        """Every cell where the player to move makes five right now (sorted)."""
+        if self.done:
+            return np.array([], dtype=np.int64)
+        cells = self.board.reshape(-1)[FIVE_WINDOWS]
+        empty = cells == 0
+        lines = (empty.sum(axis=1) == 1) & ((cells == self.current_player).sum(axis=1) == 4)
+        return np.unique(FIVE_WINDOWS[lines][empty[lines]])
+
+    def loses_in_two(self):
+        """
+        Is the player to move certainly lost: unable to make five now, while the
+        opponent already has two or more different cells that make five (an open
+        four, or two fours)? One stone blocks only one of those cells, so the
+        opponent wins next move. Pure rule check, like has_immediate_win().
+        """
+        if self.done:
+            return False
+        cells = self.board.reshape(-1)[FIVE_WINDOWS]
+        empty = cells == 0
+        one_empty = empty.sum(axis=1) == 1
+        if np.any(one_empty & ((cells == self.current_player).sum(axis=1) == 4)):
+            return False
+        threats = one_empty & ((cells == -self.current_player).sum(axis=1) == 4)
+        if threats.sum() < 2:
+            return False
+        return np.unique(FIVE_WINDOWS[threats][empty[threats]]).size >= 2
+
     def step(self, action):
         if self.done:
             raise ValueError("Game is already over")

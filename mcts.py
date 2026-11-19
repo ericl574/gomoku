@@ -74,6 +74,9 @@ class MCTS:
         self.cache_size = cache_size
         # Win-in-one: a leaf whose player to move can make five right now is a
         # certain win (+1), decided by the rules alone, without the network.
+        # Loss-in-two: a leaf whose player to move cannot make five but faces
+        # two or more different five-making cells (open four, two fours) is a
+        # certain loss (-1), so an open four is never mistaken for a fair position.
         self.win_check = bool(win_check)
         self._cache = OrderedDict()
         self._root = None
@@ -136,11 +139,18 @@ class MCTS:
                 "network_calls": 0,
                 "cache_hits": 0,
                 "win_in_one": 0,
+                "loss_in_two": 0,
             }
             if progress_callback is not None:
                 progress_callback(0, self.simulations)
             if not root.children:
                 self._evaluate(state, root)
+            if self.win_check:
+                # With loss-in-two, a move that keeps an open four also scores
+                # +1, so make five now: only five-making moves stay at the root.
+                wins = set(state.winning_moves().tolist())
+                if wins:
+                    root.children = {a: c for a, c in root.children.items() if a in wins}
 
             # Never mix fresh root noise with noise left over from an earlier search.
             for child in root.children.values():
@@ -176,6 +186,10 @@ class MCTS:
                     # Left unexpanded on purpose: revisits re-check and get +1 again.
                     value = 1.0
                     self.last_search_stats["win_in_one"] += 1
+                elif self.win_check and simulation_state.loses_in_two():
+                    # Opponent has an open four (or two fours): certain loss.
+                    value = -1.0
+                    self.last_search_stats["loss_in_two"] += 1
                 else:
                     value = self._evaluate(simulation_state, node)
                 self._backup(path, value)

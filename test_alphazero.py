@@ -279,26 +279,92 @@ class WinInOneTests(unittest.TestCase):
         state.board[3, 3:6] = -1
         return state
 
-    def test_own_win_is_still_played(self):
-        wins = {9 * 19 + 4, 9 * 19 + 9}
-        # Without FPU reduction a know-nothing network still finds the win:
-        # the search itself values a five correctly.
-        policy, _ = MCTS(FlatNetwork(), simulations=400, fpu_reduction=0.0).search(
-            self._own_win_position())
-        self.assertIn(int(np.argmax(policy)), wins)
+    def test_own_win_is_played_now(self):
+        wins = [9 * 19 + 4, 9 * 19 + 9]
+        # Keeping the open four would also be a certain win (loss-in-two), so
+        # the root keeps only the moves that make five now, even for a
+        # know-nothing network, and the search policy is only on them.
+        for fpu in (0.0, 0.2):
+            policy, _ = MCTS(FlatNetwork(), simulations=400, fpu_reduction=fpu).search(
+                self._own_win_position())
+            self.assertEqual(np.flatnonzero(policy).tolist(), wins)
+        self.assertEqual(self._own_win_position().winning_moves().tolist(), wins)
 
-        # Known FPU trade-off (as in Leela Zero / KataGo): the default search
-        # relies on the policy prior to try a move at all. A modest prior on the
-        # winning cells (~5% each) is enough.
-        class HintNetwork(FlatNetwork):
-            def forward(self, x):
-                logits, value = super().forward(x)
-                logits = logits.clone()
-                logits[:, list(wins)] += 3.0
-                return logits, value
+    def test_winning_moves_match_brute_force(self):
+        rng = np.random.default_rng(7)
+        for _ in range(200):
+            state = GomokuState()
+            for _ in range(int(rng.integers(8, 60))):
+                legal = [int(a) for a in state.legal_actions()
+                         if abs(a // 19 - 9) <= 4 and abs(a % 19 - 9) <= 4]
+                if state.done or not legal:
+                    break
+                state.step(int(rng.choice(legal)))
+            if state.done:
+                continue
+            expected = []
+            for action in state.legal_actions():
+                trial = state.clone()
+                trial.step(int(action))
+                if trial.winner == state.current_player:
+                    expected.append(int(action))
+            self.assertEqual(state.winning_moves().tolist(), expected)
 
-        policy, _ = MCTS(HintNetwork(), simulations=400).search(self._own_win_position())
-        self.assertIn(int(np.argmax(policy)), wins)
+
+def brute_force_loses_in_two(state):
+    """Every move of the player to move lets the opponent make five next."""
+    if brute_force_immediate_win(state):
+        return False
+    for action in state.legal_actions():
+        trial = state.clone()
+        trial.step(int(action))
+        if not trial.done and not trial.has_immediate_win():
+            return False
+    return True
+
+
+class LossInTwoTests(unittest.TestCase):
+    def test_fast_check_matches_brute_force_on_random_boards(self):
+        rng = np.random.default_rng(11)
+        checked = losses = 0
+        for _ in range(300):
+            state = GomokuState()
+            for _ in range(int(rng.integers(8, 60))):
+                legal = [int(a) for a in state.legal_actions()
+                         if abs(a // 19 - 9) <= 4 and abs(a % 19 - 9) <= 4]
+                if state.done or not legal:
+                    break
+                state.step(int(rng.choice(legal)))
+            if state.done:
+                continue
+            expected = brute_force_loses_in_two(state)
+            self.assertEqual(state.loses_in_two(), expected)
+            checked += 1
+            losses += expected
+        self.assertGreater(checked, 200)
+        self.assertGreater(losses, 5)  # the test really exercised lost positions
+
+    def test_open_four_split_fours_and_a_single_four(self):
+        state = GomokuState()
+        state.board[9, 6:10] = 1           # black open four, white to move
+        state.current_player = -1
+        self.assertTrue(state.loses_in_two())
+        state.board[9, 5] = -1             # one end blocked: only (9, 10) left
+        self.assertFalse(state.loses_in_two())
+        state.board[3, [2, 3, 5, 6]] = 1   # plus a split four X X . X X: two cells
+        self.assertTrue(state.loses_in_two())
+        state.board[12, 2:6] = -1          # but white can make five first
+        self.assertFalse(state.loses_in_two())
+
+    def test_search_makes_the_open_four(self):
+        state = GomokuState()
+        state.board[9, 6:9] = 1            # black open three, black to move
+        state.board[[2, 4, 15], [2, 15, 4]] = -1
+        open_fours = {9 * 19 + 5, 9 * 19 + 9}
+        search = MCTS(FlatNetwork(), simulations=400, fpu_reduction=0.0)
+        policy, _ = search.search(state)
+        self.assertIn(int(np.argmax(policy)), open_fours)
+        self.assertGreater(search.last_search_stats["loss_in_two"], 0)
 
 
 class IntegrationTests(unittest.TestCase):
