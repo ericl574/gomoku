@@ -1,0 +1,8 @@
+{
+ "run": "2026-11-17_1539_sims512",
+ "file": "round_303_games1818.pt",
+ "iteration": 303,
+ "games": 1818,
+ "updates": 15150,
+ "architecture": "resnet_global"
+}

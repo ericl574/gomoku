@@ -11,3 +11,6 @@ __pycache__/
 
 # macOS
 .DS_Store
+
+# Test-only JS tooling for site/ (npm install in tools/js)
+tools/js/node_modules/

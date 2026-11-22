@@ -1,0 +1,9 @@
+{
+  "name": "gomoku-site-tools",
+  "private": true,
+  "description": "Test-only tools for site/engine.js (not deployed).",
+  "type": "module",
+  "devDependencies": {
+    "onnxruntime-node": "1.20.1"
+  }
+}

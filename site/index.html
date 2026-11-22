@@ -1,0 +1,68 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f4f2eb">
+  <title>Gomoku AI</title>
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="style.css">
+  <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.wasm.min.js" defer></script>
+  <script src="engine.js" defer></script>
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <div class="page">
+    <header class="site-header">
+      <a class="brand" href="./" aria-label="Gomoku home">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i><i></i><i></i></span>
+        <span>gomoku<span class="brand-dot">.</span></span>
+      </a>
+      <span class="local-badge"><span></span> Runs in your browser</span>
+    </header>
+
+    <main>
+      <section class="intro" aria-labelledby="title">
+        <div><p class="eyebrow">NINETEEN LINES. FIVE TO WIN.</p><h1 id="title">Meet your next move.</h1></div>
+        <p class="intro-note" id="intro-note">An AlphaZero AI, trained from scratch by self-play.<br> It takes black; you bring the white stones.</p>
+      </section>
+
+      <div class="game-layout">
+        <section class="board-section" aria-label="Gomoku game">
+          <div class="board-heading"><span>THE BOARD <span class="small-dot">·</span> 19 × 19</span><span id="move-count">MOVE 00</span></div>
+          <div class="board-frame">
+            <div class="board-stage" id="board-stage">
+              <svg id="board-lines" viewBox="0 0 760 760" aria-hidden="true"></svg>
+              <div id="board" class="intersections" role="group" aria-label="Gomoku board. You play white." aria-describedby="board-help"></div>
+            </div>
+          </div>
+          <p class="board-help" id="board-help"><span aria-hidden="true">↗</span> Click an empty intersection to place a stone. Arrow keys work, too.</p>
+        </section>
+
+        <aside class="game-panel" aria-label="Game status and controls">
+          <section class="status-card" aria-live="polite" aria-atomic="true">
+            <div class="status-kicker"><span class="status-dot" id="status-dot"></span><span id="status-label">GETTING READY</span></div>
+            <h2 id="status-title">Setting the board…</h2>
+            <p id="status-description">Loading the AI (about 300 KB)…</p>
+          </section>
+
+          <div class="players">
+            <div class="player" id="player-black"><span class="player-stone black" aria-hidden="true"></span><div><h3 id="black-name">AI</h3><p>Black · moves first</p></div><span class="player-tag" id="black-tag">AI</span></div>
+            <div class="player" id="player-white"><span class="player-stone white" aria-hidden="true"></span><div><h3 id="white-name">You</h3><p>White · make it five</p></div><span class="player-tag" id="white-tag">YOU</span></div>
+          </div>
+
+          <button class="new-game" id="new-game" type="button" disabled><span aria-hidden="true">↻</span> New game</button>
+          <p class="error" id="error" role="alert" hidden></p>
+
+          <section class="game-details" aria-label="Last move"><span>LAST AI MOVE</span><strong id="last-ai-move">—</strong></section>
+          <section class="game-details" aria-label="AI model"><span>AI MODEL</span><strong id="model-info" title="">—</strong></section>
+          <section class="game-details" aria-label="AI think time"><span>LAST THINK TIME</span><strong id="think-time" title="">—</strong></section>
+
+          <section class="how-to"><h3>A little strategy, a little instinct.</h3><p>Connect five stones in a horizontal, vertical, or diagonal line before your opponent does.</p><div class="five-stones" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i></div><p class="quiet-note">No clock. Take your time.</p></section>
+        </aside>
+      </div>
+    </main>
+    <footer><span>五子棋 <span class="footer-divider">/</span> The game of five</span><span>AlphaZero · ResNet + MCTS · ONNX Runtime Web</span></footer>
+  </div>
+</body>
+</html>
